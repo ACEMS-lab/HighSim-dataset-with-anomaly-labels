@@ -80,4 +80,3 @@ python tools/plot_train_curves.py runs/latentD figures/fig_latent_dim
 ## 5. 注意
 
 - `HighSim_data_with_Anomaly(Final).csv` 是本仓库已发布的标注数据集（Git LFS），其中的 `Anomaly` 标注来自早期版本模型，与 v17 不同；是否用 v17 结果更新，另行决定。
-- 训练窗口、阈值、GT 定义的历史决策见代码注释（以 "v16b" 等版本号标注）。
