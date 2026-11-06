@@ -1,0 +1,20 @@
+\begin{table}
+\caption{Comparison with baselines on the validation set (47 GT events). All neural models were trained once with identical settings (TensorFlow, Metal GPU backend); IForest and PCA used scikit-learn. Detected tier: events produced by each model (SPE $>$ UCL for $\geq$1 s; adjacent events within 3 s merged). Alarms on all-normal frames: share of alarm frames within detected events at which all four utility features are zero (a GT-free indicator of noise-type false alarms; zero by construction for the 3$\sigma$ threshold). Confirmed tier (utility-based methods only): detected events containing at least one frame whose joint utility intensity reaches the confirmation threshold. GT-precision counts only overlaps with GT and is a lower bound of precision.}
+\label{tab:baselines}
+\begin{tabular}{lccccccc}
+\toprule
+Method & Detected events & Recall (detected) & GT-precision (detected) & Alarms on all-normal frames (\%) & Confirmed events & Recall (confirmed) & GT-precision (confirmed) \\
+\midrule
+IForest (raw) & 146 & 0.213 & 0.069 & 57.2 & — & — & — \\
+PCA-SPE (raw) & 275 & 0.170 & 0.029 & 63.3 & — & — & — \\
+MLP-AE (raw) & 358 & 0.234 & 0.031 & 61.5 & — & — & — \\
+LSTM-AE (raw) & 346 & 0.936 & 0.127 & 49.2 & — & — & — \\
+GRU-AE (raw, global UCL) & 353 & 0.936 & 0.125 & 49.5 & — & — & — \\
+GRU-AE + GMM (raw) & 225 & 0.808 & 0.169 & 44.8 & — & — & — \\
+Utility 3σ threshold (no model) & 220 & 0.915 & 0.196 & 0.0 & 90 & 0.915 & 0.478 \\
+GRU-AE (utility, global UCL) & 447 & 1 & 0.105 & 9.6 & 92 & 0.957 & 0.489 \\
+LSTM-AE + GMM (utility) & 212 & 1 & 0.222 & 5.1 & 88 & 0.957 & 0.511 \\
+GRU-AE + GMM (utility, proposed) & 255 & 1 & 0.184 & 5.3 & 92 & 0.957 & 0.489 \\
+\bottomrule
+\end{tabular}
+\end{table}

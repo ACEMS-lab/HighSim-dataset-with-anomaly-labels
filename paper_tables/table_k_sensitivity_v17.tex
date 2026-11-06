@@ -1,0 +1,22 @@
+\begin{table}
+\caption{Sensitivity of detection results to the number of GMM components $k$ (validation set, 47 GT events). $k=1$ corresponds to a single global UCL. The selected model ($k=6$) is the BIC-optimal $k$ under the constraint that every cluster contains at least 2\% of training windows.}
+\label{tab:k_sensitivity}
+\begin{tabular}{lcccccc}
+\toprule
+k & Min. cluster share (\%) & Meets 2\% constraint & Detected events & GT detected (detected tier) & Confirmed events & GT detected (confirmed tier) \\
+\midrule
+1 (global UCL) & — & — & 447 & 47/47 & 92 & 45/47 \\
+2 & 29.9 & Yes & 294 & 47/47 & 94 & 45/47 \\
+3 & 14.9 & Yes & 263 & 47/47 & 94 & 45/47 \\
+4 & 5.4 & Yes & 234 & 47/47 & 91 & 45/47 \\
+5 & 5.0 & Yes & 233 & 47/47 & 90 & 45/47 \\
+6 & 2.1 & Yes & 255 & 47/47 & 92 & 45/47 \\
+7 & 1.5 & No & 233 & 47/47 & 90 & 45/47 \\
+8 & 1.2 & No & 215 & 47/47 & 88 & 45/47 \\
+9 & 1.2 & No & 236 & 47/47 & 86 & 45/47 \\
+10 & 0.8 & No & 235 & 47/47 & 87 & 45/47 \\
+11 & 0.7 & No & 241 & 47/47 & 88 & 45/47 \\
+12 & 0.6 & No & 227 & 47/47 & 89 & 45/47 \\
+\bottomrule
+\end{tabular}
+\end{table}

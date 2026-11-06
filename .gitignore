@@ -1,0 +1,8 @@
+# 运行结果、缓存、复核图（体积大，可由代码重新生成；见 VERSION_v17.md）
+runs/
+_baseline_results_cache/
+_baseline_cache_*/
+review_*/
+__pycache__/
+*.pyc
+.DS_Store
