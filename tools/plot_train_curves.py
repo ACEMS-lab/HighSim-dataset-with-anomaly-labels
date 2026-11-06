@@ -22,7 +22,8 @@ PANELS = [("train_mse", "Training MSE", "MSE"), ("val_mse", "Validation MSE", "M
 
 def main(root="runs/latentD", prefix="fig_latent_dim"):
     plt.rcParams.update({"font.family": "serif", "font.serif": ["Times New Roman", "DejaVu Serif"], "font.size": 12,
-                         "mathtext.fontset": "dejavuserif"})
+                         "mathtext.fontset": "custom", "mathtext.rm": "Times New Roman",
+                         "mathtext.it": "Times New Roman:italic", "mathtext.bf": "Times New Roman:bold"})
     H = {}
     for f in sorted(glob.glob(os.path.join(root, "D*", "train_history.csv"))):
         d = pd.read_csv(f); H[int(d.latent_dim.iloc[0])] = d

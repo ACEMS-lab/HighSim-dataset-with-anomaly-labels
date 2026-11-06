@@ -95,8 +95,8 @@ def main(out="fig_latent_clusters.png", n_per=600):
         info = f"PCA explained variance {pj.explained_variance_ratio_.round(3).tolist()}"
     names = json.load(open("cluster_names.json"))
     rng = np.random.default_rng(42)
-    fig, ax = plt.subplots(figsize=(7.5, 5.6))
     plt.rcParams.update({"font.family": "serif", "font.serif": ["Times New Roman", "DejaVu Serif"]})
+    fig, ax = plt.subplots(figsize=(7.5, 5.6))
     order = sorted(share, key=lambda k: -share[k])
     dropped = {}
     for k in order:
