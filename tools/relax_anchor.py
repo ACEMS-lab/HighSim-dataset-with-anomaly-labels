@@ -1,10 +1,10 @@
 """
-relax_anchor.py —— P7b 锚点：前车切换后，本车与新前车速度差的松弛时间常数 τ。
+relax_anchor.py —— 标定前车切换后本车与新前车速度差的松弛时间常数 τ（utility_phi.RELAX_TAU_S）。
 
-对每次前车切换（同一辆车 Leader_ID 改变，不含轨迹开始时已有的前车）、跟驰中（THW < THW_FREE）的帧，
-统计切换后每 0.5 s 的 |本车速度 − 前车速度| 中位数；以切换后 10–20 s 的中位数为稳态，
-超出量 e(t) 按 e0·exp(−t/τ) 拟合（0–10 s，对 log e 线性回归）。
-用法（在 runs/<run> 下）：python ../../tools/relax_anchor.py
+对跟驰中（THW < THW_FREE）的前车切换，统计切换后每 0.5 s 的 |Δv| 中位数，以 10–20 s 为稳态，
+超出量在 0–10 s 内按 e0·exp(−t/τ) 拟合。
+
+用法（在 runs/<run> 目录下）：python ../../tools/relax_anchor.py
 """
 import os, sys
 import numpy as np

@@ -1,14 +1,14 @@
 """
-plot_latent_clusters.py —— GRU-AE 潜空间中的 GMM 驾驶状态（英文、简化）。在 runs/<run> 目录下运行：
+plot_latent_clusters.py —— GRU-AE 潜空间中各 GMM 驾驶状态的二维投影散点图。
 
+窗口与 GMM 标签取自 val_windows.npz；须在训练模型的同一设备上运行（换设备载入后潜向量输出不同）。
+每类随机抽 N_PER_CLUSTER 个窗口作散点，椭圆为该类投影点的稳健高斯置信椭圆。
+类名读 cluster_names.json（模型重训后类序号会变，须重新核对）。
+
+用法（在 runs/<run> 目录下）：
     python ../../tools/plot_latent_clusters.py [OUT=fig_latent_clusters.png] [N_PER_CLUSTER=600]
-
-- 窗口：验证集全部窗口（val_windows.npz 的 vid/start，与检测时同一组窗口与 GMM 标签）。
-- 潜向量：gruae_model.keras 的 latent_vector 层。必须在训练时的同一设备上运行（Mac 上即 GPU/Metal）：
-  该模型在隐藏 GPU 的进程中载入后输出完全不同（见 exper_fixed._baseline_task 注释）。
-- LV1/LV2：标准化潜向量的前两个主成分。
-- 每类随机抽 N_PER_CLUSTER 个窗口作散点（小类也看得见），椭圆 = 该类投影点的 95% 高斯置信椭圆。
-- 类名读 cluster_names.json（按训练集各类画像命名；模型重训后类序号会变，须重新核对）。
+环境变量：PROJ=tsne|lda|pca（投影方式，默认 tsne）、JITTER（t-SNE 前扰动 SD，默认 0.01）、
+    MIXED（混合类编号）、INSIDE_ONLY=1（只画椭圆内的点）、ELLIPSE_CHI2（椭圆 χ² 分位，默认 99%）。
 """
 import json
 import os
@@ -30,6 +30,7 @@ COLORS = ["#3b6fb6", "#2a9d8f", "#8ab17d", "#e9a23b", "#c8553d", "#9b72aa", "#6c
 
 
 def build_windows(vid, start):
+    """按 (车辆, 起始帧) 从 phi_val.csv 重建长度 T 的模型输入窗口。"""
     df = pd.read_csv("phi_val.csv", usecols=["Vehicle_ID", "Frame_ID"] + MODEL_COLS)
     df["is_truck"] = df["is_truck"].fillna(0)
     df = df.sort_values(["Vehicle_ID", "Frame_ID"])
@@ -42,7 +43,8 @@ def build_windows(vid, start):
     return X
 
 
-def ellipse(ax, pts, color, q=float(os.environ.get("ELLIPSE_CHI2", "9.210")), ls="-", fill=0.10):   # 默认 χ²(2) 99%   # χ²(2) 95%；稳健协方差（MCD），不让长尾离群点撑大椭圆
+def ellipse(ax, pts, color, q=float(os.environ.get("ELLIPSE_CHI2", "9.210")), ls="-", fill=0.10):   # 默认 χ²(2) 99%
+    """画 χ² 分位 q 的高斯置信椭圆；用稳健协方差（MCD），避免长尾离群点撑大椭圆。"""
     from sklearn.covariance import MinCovDet
     sub = pts if len(pts) <= 5000 else pts[np.random.default_rng(0).choice(len(pts), 5000, replace=False)]
     try:
@@ -65,12 +67,12 @@ def main(out="fig_latent_clusters.png", n_per=600):
     X = build_windows(vid, start)
     norm = np.load("norm_params.npz")
     Xn = (X - norm["mu"]) / norm["sd"]
-    from New import zero_recurrent_bias
+    from model import zero_recurrent_bias
     ae = zero_recurrent_bias(tf.keras.models.load_model("gruae_model.keras", compile=False))
     enc = tf.keras.Model(ae.input, ae.get_layer("latent_vector").output)
     Z = enc.predict(Xn, verbose=0, batch_size=2048)
     Z = (Z - Z.mean(0)) / (Z.std(0) + 1e-8)
-    share = {k: float(np.mean(lab == k)) for k in range(lab.max() + 1)}   # 真实占比（全部验证窗口），抽样前算
+    share = {k: float(np.mean(lab == k)) for k in range(lab.max() + 1)}   # 真实占比，抽样前计算
     proj = os.environ.get("PROJ", "tsne")
     if proj == "lda":      # 线性判别投影：选最能分开各类的两个线性方向（LV1/LV2）
         from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
@@ -82,8 +84,7 @@ def main(out="fig_latent_clusters.png", n_per=600):
         keep = np.concatenate([rng0.choice(np.where(lab == k)[0], min(n_per, (lab == k).sum()), replace=False)
                                for k in range(lab.max() + 1)])
         Z, lab = Z[keep], lab[keep]
-        # 平稳行驶窗口（φ≡0）的潜向量几乎完全相同，t-SNE 会把重复点排成弧形（"月牙"）假象；
-        #   降维前加 0.01 SD 的高斯扰动打破重复（仅用于展示，图注说明）。JITTER=0 关闭。
+        # 平稳行驶窗口的潜向量几乎完全相同，t-SNE 会把重复点排成弧形假象；降维前加 0.01 SD 高斯扰动打破重复。
         jit = float(os.environ.get("JITTER", "0.01"))
         if jit > 0:
             Z = Z + np.random.default_rng(1).normal(0, jit, Z.shape)
@@ -107,7 +108,7 @@ def main(out="fig_latent_clusters.png", n_per=600):
         mixed = os.environ.get("MIXED", "6").split(",")   # 散布在多类之间的混合类：虚线、淡填充
         mu_e, cov_e, q_e = ellipse(ax, P[idx], c, ls="--" if str(k) in mixed else "-", fill=0.03 if str(k) in mixed else 0.10)
         if os.environ.get("INSIDE_ONLY") == "1":
-            # 只画落在本类椭圆内的点（展示用；被省略的比例打印出来，须写进图注）
+            # 只画落在本类椭圆内的点，省略比例打印出来供图注说明
             dlt = P[pick] - mu_e
             d2 = np.einsum("ij,jk,ik->i", dlt, np.linalg.inv(cov_e), dlt)
             ins_ = d2 <= q_e

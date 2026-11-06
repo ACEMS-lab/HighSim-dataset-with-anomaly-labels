@@ -1,10 +1,8 @@
 """
-merge_aanomaly.py
------------------
-Uses pred_events_all.csv (event-level: start_frame, end_frame) to mark
-every frame in HighSim_data_with_smooth.csv that falls inside a detected
-anomaly event as AAnomaly=1, all others 0.
-Output: HighSim_data_with_Anomaly(Final).csv
+merge_aanomaly.py —— 把 pred_events_all.csv 中检测事件覆盖的帧标为 AAnomaly=1，其余为 0。
+
+用法（在 pipeline 输出目录下）：python merge_aanomaly.py
+输出：HighSim_data_with_Anomaly(Final).csv
 """
 
 import numpy as np
@@ -22,13 +20,12 @@ for c in ["Vehicle_ID", "Frame_ID", "Global_X", "Global_Y", "Class"]:
 print(f"Filtered vehicles in region: {df_smooth['Vehicle_ID'].nunique()}")
 
 events = pd.read_csv(EVENTS_CSV, low_memory=False)
-# First column was saved with a stray Chinese character prefix; strip it.
+# 去掉首列列名中混入的多余字符
 events.columns = [c.lstrip("那").strip() for c in events.columns]
 events["Vehicle_ID"]   = pd.to_numeric(events["Vehicle_ID"],   errors="coerce")
 events["start_frame"]  = pd.to_numeric(events["start_frame"],  errors="coerce")
 events["end_frame"]    = pd.to_numeric(events["end_frame"],    errors="coerce")
 
-# Mark anomalous frames by expanding each event into frame IDs
 aanomaly = np.zeros(len(df_smooth), dtype=np.int8)
 
 for _, ev in events.iterrows():

@@ -1,19 +1,18 @@
 """
-pipeline.py —— 唯一入口：从原始 HighSim 数据到检测结果、基线对比和噪声核查。
+pipeline.py —— 统一入口：原始 HighSim 数据 → 特征、训练、检测、基线对比。
 
 用法：
-    python pipeline.py --workdir runs/v4 --stage all
-    python pipeline.py --workdir runs/v4 --stage detect       # 只重跑检测（复用已训练模型）
+    python pipeline.py --workdir runs/latest --stage all
+    python pipeline.py --workdir runs/latest --stage detect      # 只重跑检测（复用已训练模型）
 
 阶段（按顺序，all = 全部）：
-    data       Data.py          原始数据 → 平滑速度/加速度、TTC、数据质量标记(Edge/BadTrack/BadVehicle)、GT 事件
-    features   New.py           → phi_all.csv（phi1~phi4，已剔除不可信帧）
-    train      New.py           → gruae_model.keras, norm_params.npz
-    detect     New.py           → GMM + cluster UCL + 帧/事件级检测 + 与 GT 对齐评估
-    baselines  exper_fixed.py   → 基线/消融对比 experiment_results.csv
-    verify     verify_events.py → 每个检测事件的物理证据 / 噪声标记 event_verification.csv
+    data       Data.py           平滑速度/加速度、TTC、数据质量标记、GT 事件
+    features   model.py          → phi_all.csv（φ1–φ4）
+    train      model.py          → gruae_model.keras, norm_params.npz
+    detect     model.py          → GMM 分类 UCL、帧/事件级检测与评估
+    baselines  baselines.py      → 基线/消融对比 experiment_results*.csv
 
-所有输出写入 --workdir，不会覆盖其他运行的结果。作图脚本在 plots/ 下，在 workdir 中运行即可。
+所有输出写入 --workdir。
 """
 import argparse
 import os
@@ -22,7 +21,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-STAGES = ["data", "features", "train", "detect", "baselines", "verify"]
+STAGES = ["data", "features", "train", "detect", "baselines"]
 
 
 def main():
@@ -57,16 +56,13 @@ def main():
             import Data
             Data.main(raw)
         elif st in ("features", "train", "detect"):
-            import New
-            {"features": New.stage_features,
-             "train":    lambda: New.stage_train(epochs=args.epochs),
-             "detect":   New.stage_detect}[st]()
+            import model
+            {"features": model.stage_features,
+             "train":    lambda: model.stage_train(epochs=args.epochs),
+             "detect":   model.stage_detect}[st]()
         elif st == "baselines":
-            import exper_fixed
-            exper_fixed.main()
-        elif st == "verify":
-            import verify_events
-            verify_events.main("pred_events_all.csv")
+            import baselines
+            baselines.main()
     print("\n[pipeline] done.")
 
 

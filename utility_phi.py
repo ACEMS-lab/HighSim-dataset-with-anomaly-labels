@@ -1,35 +1,26 @@
 """
-utility_phi.py —— 效用特征 φ1–φ4（v7）
+utility_phi.py —— 效用特征 φ1–φ4。
 
-统一标度：每个 φ 都先换算成"相对正常驾驶偏离了几个 σ"（z），再映射
+统一标度：每个 φ 先换算成相对正常驾驶偏离的 σ 数 z，再映射
     φ = clip((z − 1) / (Z_SAT − 1), 0, 1)，Z_SAT = 5
-即 1σ 以内为 0，5σ（与 GT"极端"同一标准）及以上为 1，中间线性。
-旧版用全体帧 z 的 P99.99 作为封顶点：φ1 的尾巴被排队路段（邻车 MAD 极小 → z 可达 40+）拉得极长，
-Z_MAX=43，自由流里快 20 mph 也只有 φ1≈0.14。
+即 1σ 以内为 0，5σ（与 GT"极端"同一标准）及以上为 1；|z| ≥ 3 为离群。
 
-φ1 速度偏离（考虑周围环境）
-    正常速度区间 [lo, hi]，超出区间的部分才算偏离（区间内 φ1=0）
-      - 局部车流：同帧、同车道、纵向 ±500 ft 内其他车辆速度中位数（phi1_local.py）；
-        变道过渡期（车道号切换前后 1.5 s）取原车道与目标车道中偏差较小者，避免切换瞬间跳变。
-      - 自由流速度：同车道 × 车型 × 500 ft 路段内、前方无约束（车头时距 ≥ THW_FREE 或无前车）车辆的速度中位数
-      - w：受约束程度。车头时距 ≤ THW_CONS → w=0（跟局部车流比）；≥ THW_FREE 或无前车 → w=1（跟自由流比），中间线性
-      受约束：区间 = 局部车流速度；自由：区间 = [min(局部, 自由流), max(局部, 自由流)]，中间按 w 过渡
-      → 前车慢但离得远、后车加速向自由流速度靠拢：在区间内，不算异常；开到远超自由流速度仍算异常。
-    σ：受约束 = 相对局部车流偏差的稳健 σ；自由 = 自由车辆相对自由流速度偏差的稳健 σ（按车道×路段）。
-    z = 超出区间的量 / σ + 1，所以超出区间 5σ 时 φ1=1。
+φ1 速度偏离车流：超出正常速度区间 [lo, hi] 的部分才算偏离。
+    - 局部车流：同帧、同车道、纵向 ±500 ft 内其他车速度中位数（phi1_local.py）；
+      变道过渡期取原车道与目标车道中偏差较小者。
+    - 自由流速度：同车道 × 车型 × 500 ft 路段内无约束车辆（THW ≥ THW_FREE 或无前车）的速度中位数。
+    - w：受约束程度，THW ≤ THW_CONS → 0（比局部车流），≥ THW_FREE → 1（比自由流），中间线性。
+    - 跟驰时区间还包含前车速度、前车切换后的松弛过渡；偏快一侧上限不低于自由流速度
+      （逼近前车的风险由 φ4 衡量）。
+    z = 超出量 / σ + 1，σ 按受约束/自由状态分别用稳健估计。
 
-φ2 急加/减速：周荣贵等(2024) 速度-阈值曲线的 z（Data.py → Acc_z），z=5 → 1。
+φ2 加减速：周荣贵等(2024) 速度-阈值曲线的 z（accel_thresholds.py）。
+    减速侧用与 GT 同一口径的 z（Data.py → Acc_zgt）；
+    加速侧扣除前车加速度响应与情境，且未超出物理门槛时为 0。
 
-φ3 横向行为 = max(车道保持, 变道横移速度, 蛇行)
-    - 车道保持（v8）：车道内漂移正常；|偏移| 超过正常 P99（车道×车型×500 ft 路段）后线性增至
-      半车道宽（压线，数据标定）时为 1。变道过程（车道号切换前后 LC_WIN_S 秒）内不计。
-    - 变道横移速度：横向速度相对"一般变道的峰值横向速度"偏离几个 σ（横向位置始终相对同一条车道中心线计算，
-      车道号切换时不跳变）。
-    - 蛇行：A→B→A 回头变道（在 B 停留 ≥0.5 s、且横向确有 ≥ WEAVE_MIN_DX_FT 位移），间隔越短越高：
-      间隔 ≤ 全体回头变道间隔的 P5 → 1，≥ P25 → 0。同方向连续变道（如逐条并入匝道）不计。
+φ3 横向 = max(车道保持, 变道横移速度, 蛇行 A→B→A)。
 
-φ4 碰撞风险：纵向 TTC 项不变；侧向项的安全距离按数据标定（相邻车道并排车辆车身边缘间距的 P1 处 φ=0.5、P5 处 φ=0.1）。
-    数据中 Width 为外接框（小汽车 8 ft、货车 12.5 ft，比实际车宽大），旧版固定 3 ft 安全距离使 10% 的正常并排 φ≥0.87。
+φ4 碰撞风险 = max(纵向 TTC, 侧向净距, 持续车头时距)。
 """
 import numpy as np
 import pandas as pd
@@ -39,14 +30,14 @@ FPS = 30
 THW_CONS, THW_FREE = 2.0, 4.0
 V_FLOOR = 44.0            # 30 mph（ft/s）
 LC_TRANS_S = 1.5          # φ1：车道号切换前后按两条车道取参照
-RELAX_TAU_S = 4.7         # v11 P7b：前车切换后速度差松弛时间常数（tools/relax_anchor.py：v10 数据 8365 次切换，0–10 s 指数拟合 4.66 s）
+RELAX_TAU_S = 4.7         # 前车切换后速度差松弛时间常数（s），tools/relax_anchor.py 指数拟合
 LC_WIN_S = 2.5            # φ3：变道过程窗口
-YBIN_FT = 500.0
-MIN_N = 3000
+YBIN_FT = 500.0           # 路段分段长度（ft）
+MIN_N = 3000              # 分段统计最少样本，不足则回退
 LAT_K = 15                # 横向速度差分步长（0.5 s）
 WEAVE_MIN_DWELL = 15      # 在 B 车道至少 0.5 s
 WEAVE_MIN_DX_FT = 6.0     # 横向位移至少半个车道
-WEAVE_PAD = 30
+WEAVE_PAD = 30            # 蛇行分值向前后各延伸 1 s
 
 
 def phi_from_z(z):
@@ -95,14 +86,14 @@ def _seg_stat(df, val, ok, func, by_class=True, truck=None, lo=None, hi=None, la
 
 
 def _lane_switches(df):
-    """每辆车的车道号切换：返回 DataFrame(row 位置 k, from, to)，df 须按 Vehicle_ID, Frame_ID 排序。"""
+    """每辆车的车道号切换位置 k 及前后车道；df 须按 Vehicle_ID, Frame_ID 排序。"""
     vid = df["Vehicle_ID"].to_numpy(); ln = df["Lane_Num"].to_numpy(float)
     k = np.flatnonzero((vid[1:] == vid[:-1]) & (ln[1:] != ln[:-1])) + 1
     return pd.DataFrame({"k": k, "vid": vid[k], "frm": ln[k - 1], "to": ln[k]})
 
 
 def _near_switch(df, sw, half):
-    """每行到最近一次车道切换的帧距 ≤ half 的掩码，以及该切换另一侧的车道号"""
+    """距车道切换 ≤ half 帧的掩码，及该切换另一侧的车道号。"""
     n = len(df); mask = np.zeros(n, bool); other = np.full(n, np.nan)
     vid = df["Vehicle_ID"].to_numpy()
     for r in sw.itertuples():
@@ -129,8 +120,7 @@ def compute_phi1(df, trusted, truck):
     v_loc = np.where(use_oth, v - d_oth, v - d_own)
 
     gap = df["Gap_bumper"].to_numpy(float) if "Gap_bumper" in df else np.full(len(df), np.nan)
-    # 车头时距按 max(v, V_FLOOR) 计算：排队时 3 mph、间距 30 ft 的车 THW 也有 7 s，但它显然受下游排队约束；
-    # 加速度下限后，低速车需前方净空 ≥ THW_FREE·V_FLOOR（约 176 ft）才算"自由"。
+    # 车头时距按 max(v, V_FLOOR) 计算：排队低速车即使 THW 很大也受约束，需前方净空 ≥ THW_FREE·V_FLOOR（约 176 ft）才算自由。
     thw = np.where(np.isfinite(gap) & (gap > 0), gap / np.maximum(v, V_FLOOR), np.inf)
     w = np.clip((thw - THW_CONS) / (THW_FREE - THW_CONS), 0, 1)
     free = pd.Series(thw >= THW_FREE, index=df.index)
@@ -138,38 +128,26 @@ def compute_phi1(df, trusted, truck):
           f"变道过渡帧 {trans.mean():.2%}（其中改用另一车道参照 {use_oth.sum() / max(trans.sum(), 1):.1%}）")
     v_free = _seg_stat(df, df["Speed_smooth"], trusted & free, np.median, truck=truck,
                        label="自由流速度 ft/s").to_numpy()
-    # 正常速度区间 [lo, hi]：
-    #   受约束(w=0)：区间退化为局部车流速度；
-    #   自由(w=1)：上限 = max(局部车流, 自由流速度) —— 前方空、加速向自由流速度靠拢不算异常；
-    #             下限 = min(局部车流, 自由流速度) —— 比周围车和自由流都慢才算异常。
+    # 正常速度区间：受约束时为局部车流速度；自由时为 [min(局部, 自由流), max(局部, 自由流)]，按 w 过渡。
     has = np.isfinite(v_loc)
     hi = np.where(has, (1 - w) * v_loc + w * np.maximum(v_loc, v_free), v_free)
     lo = np.where(has, (1 - w) * v_loc + w * np.minimum(v_loc, v_free), v_free)
-    # v9：跟驰中（w<1）的车，跟着前车速度走也属正常。交通波里前车速度与 ±500 ft 车流中位数可差 10 mph，
-    #     v8 中 φ1 的 3σ 离群帧 86% 处于跟驰状态，其中位数与前车只差 3.8 mph —— 是正常跟驰而非速度异常。
-    #     正常区间扩为同时包含"局部车流"与"前车速度"；比两者都快/都慢才算偏离（逼近前车由 φ4 的 TTC 负责）。
+    # 跟驰中（w<1）跟着前车速度走属正常：区间扩为包含前车速度（交通波中前车与车流中位数可差约 10 mph）。
     if "Preceding_Speed" in df:
         v_lead = df["Preceding_Speed"].to_numpy(float)
         use_l = np.isfinite(v_lead) & (w < 1)
         lo = np.where(use_l, np.minimum(lo, v_lead), lo)
         hi = np.where(use_l, np.maximum(hi, v_lead), hi)
-    # v10（P2）：前车切换后 1.5 s 内，原前车速度也在正常区间内（驾驶员尚未来得及对新前车作出反应；
-    #     v9 复核中多例 φ1 的 3σ 恰好始于前车/参照切换，Data.py → Prev_Leader_Speed）
+    # 前车切换后 1.5 s 内原前车速度也算正常（驾驶员尚未对新前车作出反应；Data.py → Prev_Leader_Speed）。
     if "Prev_Leader_Speed" in df:
         v_old = df["Prev_Leader_Speed"].to_numpy(float)
         use_o = np.isfinite(v_old) & (w < 1)
         lo = np.where(use_o, np.minimum(lo, v_old), lo)
         hi = np.where(use_o, np.maximum(hi, v_old), hi)
-    # v10（P4）：偏快一侧的上限在任何状态下都不低于路段自由流速度。跟驰中比前车/车流快但不超过正常自由流速度
-    #     属于接近前车，其风险由 φ4（TTC）衡量，不在 φ1 重复计入；只有超过自由流速度才算速度偏离（超速）。
-    #     （v10 特征统计：φ1 偏快 3σ 帧 82% 处于跟驰 THW≤2 s，中位间距 140 ft，TTC<3 s 仅 4.4%。）
-    #     下限不变：比车流、前车、自由流都慢才算偏慢。
+    # 偏快一侧上限不低于路段自由流速度：未超过自由流速度的偏快属于接近前车，由 φ4 衡量。
     hi = np.maximum(hi, np.where(np.isfinite(v_free), v_free, hi))
-    # v11（P7b，用户确认 2026-11-04）：前车切换后的松弛过渡。换了前车（本车或他车变道）后，本车与新前车的速度差
-    #     不是立刻消失，而是逐渐收敛（交通流"松弛现象"）。数据（tools/relax_anchor.py）：切换后本车−新前车速度差
-    #     中位数相对稳态（切换后 10–20 s）的超出量按指数衰减，时间常数 RELAX_TAU_S。
-    #     正常区间在切换后同时包含 新前车速度 + 切换时速度差·exp(−t/τ)（平滑递减，不硬切换）。
-    #     只作用于依赖前车的参照；本车自身急加减速仍由 φ2 判定。
+    # 前车切换后的松弛过渡：与新前车的速度差按 exp(−t/τ) 逐渐收敛（τ = RELAX_TAU_S），
+    # 正常区间包含 新前车速度 + 切换时速度差·exp(−t/τ)。
     if "Leader_ID" in df and "Preceding_Speed" in df:
         vid = df["Vehicle_ID"].to_numpy(); lid = df["Leader_ID"].fillna(-1).to_numpy()
         new_seg = np.r_[True, (vid[1:] != vid[:-1]) | (lid[1:] != lid[:-1])]
@@ -184,19 +162,16 @@ def compute_phi1(df, trusted, truck):
         path = v_l + dv0 * np.exp(-pos / (RELAX_TAU_S * FPS))
         lo = np.where(relax, np.minimum(lo, path), lo)
         hi = np.where(relax, np.maximum(hi, path), hi)
-        print(f"φ1（P7b）: 前车切换后松弛过渡（τ={RELAX_TAU_S} s）适用帧 {relax.mean():.2%}")
+        print(f"φ1: 前车切换后松弛过渡（τ={RELAX_TAU_S} s）适用帧 {relax.mean():.2%}")
     dev = np.maximum(v - hi, 0) + np.maximum(lo - v, 0)
     t = trusted.to_numpy()
-    # σ：受约束 = 相对局部车流偏差的稳健 σ（全局）；自由 = 自由车辆相对自由流速度偏差的稳健 σ（按 车道×路段）
+    # σ：受约束 = 相对局部车流偏差的稳健 σ（全局）；自由 = 相对自由流速度偏差的稳健 σ（按车道×路段）
     s_c = robust_sigma((v - v_loc)[t & (w == 0)])
     r_free = pd.Series(np.abs(v - v_free), index=df.index)
     s_f = _seg_stat(df, r_free, trusted & free, lambda a: 1.4826 * np.median(np.abs(a)), by_class=False,
                     lo=s_c, hi=None, label="自由流速度 σ ft/s").to_numpy()
     sig = (1 - w) * s_c + w * s_f
-    # v11（P7a，用户确认 2026-11-04）：偏快一侧的上限含路段自由流速度（P4），超出部分是"比自由流车辆快多少"，
-    #     其离散程度应按自由流车辆的 σ（s_f）衡量，而不是跟驰车相对局部车流的 σ（s_c ≈ 2.5 mph）。
-    #     v10 复核：本车 THW 1.6–2.1 s 被判为跟驰，超越 200 ft 外慢车时 φ1 用 s_c 而饱和（#31/41/44/34）。
-    #     逼近前车的风险由 φ4（TTC）衡量。偏慢一侧不变。
+    # 偏快一侧超出的是"比自由流快多少"，σ 至少取自由流 σ（s_f），避免跟驰车用较小的 s_c 而饱和。
     sig_fast = np.where(np.isfinite(s_f), np.maximum(sig, s_f), sig)
     z = np.where(v > hi, (v - hi) / sig_fast, dev / sig)   # 超出正常区间几个 σ；≤1σ → φ=0，≥5σ → φ=1
     phi = np.nan_to_num(phi_from_z(z), nan=0.0)
@@ -210,11 +185,8 @@ def compute_phi1(df, trusted, truck):
 
 
 # ───────────────────────── φ2 ─────────────────────────
-# v10（P1）：跟驰中跟着前车加减速是正常响应。响应延迟由数据估计（v9，399 对跟驰车 THW≤2 s、≥20 s）：
-#   本车与前车加速度的互相关在延迟 1.5 s 处最大（r=0.73），各车对最佳延迟四分位范围 0.9–2.3 s。
-#   正常区间 = [min(0, 前车在 t−2.3…t−0.9 s 的最小加速度), max(0, 同期最大加速度)]；
-#   只把超出前车的那部分加速度按 周荣贵等(2024) 速度-阈值曲线换算成 z。跟驰判定与 φ1 相同（w<1，THW<4 s）。
-#   GT（|a| z≥5）不受影响，仍按原始加速度定义。
+# 跟驰中跟着前车加减速属正常响应：正常区间 = [min(0, 前车在 t−2.3…t−0.9 s 的最小加速度), max(0, 同期最大)]，
+# 只把超出部分换算成 z。延迟范围取跟驰车对与前车加速度互相关最佳延迟的四分位范围。
 FOLLOW_LAG_LO = 27   # 0.9 s
 FOLLOW_LAG_HI = 69   # 2.3 s
 
@@ -222,10 +194,10 @@ FOLLOW_LAG_HI = 69   # 2.3 s
 def compute_phi2(df, trusted, truck, w):
     import accel_thresholds as at
     curves = at.load()
-    # v12（P9 分级 + P11）：情境等级（Data.py → CatchCls / ApprCls）决定用哪条曲线，与 GT 一致
+    # 情境等级（Data.py → CatchCls / ApprCls）决定用哪条阈值曲线，与 GT 一致
     a = df["Acc_from_vsmooth_g"].to_numpy(float)
     ctx = at.frame_ctx(a, df["CatchCls"], df["ApprCls"]) if "CatchCls" in df else None
-    grp = at.group_id(truck, df["Lane_ctx"] if "Lane_ctx" in df else df["Lane_Num"], ctx)   # v13：分流段驶出车按匝道组
+    grp = at.group_id(truck, df["Lane_ctx"] if "Lane_ctx" in df else df["Lane_Num"], ctx)   # 分流段驶出车按匝道组
     v = df["Speed_smooth"].to_numpy(float)
     z_raw = at.zscore(curves, v, a, grp)
     a_lo = np.full(len(df), np.nan); a_hi = np.full(len(df), np.nan)
@@ -246,22 +218,18 @@ def compute_phi2(df, trusted, truck, w):
     a_ex = np.where(use, a - np.clip(a, lo, hi), a)
     z = at.zscore(curves, v, a_ex, grp)
     z = np.where(a_ex == 0, 0.0, z)
-    # v14（用户确认 2026-11-05）：物理锚点 —— 本车加速度未超出正常驾驶物理范围（AASHTO 3.4 m/s² 减速；
-    #   Long 2000 起步加速 小汽车 2.2 / 货车 1.5 m/s²）时不算加减速异常（φ2 与 3σ 证据均为 0）。
-    #   v12/v13 复核：0.13–0.25 g 的起步、变道提速、驶出减速虽超过情境 5σ 线，看起来都是普通驾驶。
+    # 物理门槛：加速度未超出正常驾驶物理范围（AASHTO 减速 3.4 m/s²；Long 2000 起步加速 小汽车 2.2 / 货车 1.5 m/s²）时 z 置 0。
     pe = at.phys_exceed(a, truck)
     print(f"φ2 物理锚点：超出的可信帧 {np.mean(pe[trusted.to_numpy()]):.3%}；情境 3σ 离群帧中超出物理锚点的 "
           f"{np.mean(pe[trusted.to_numpy() & (np.abs(np.nan_to_num(z)) >= Z_OUT)]):.1%}")
-    z_ctx = np.abs(np.nan_to_num(z))      # 门槛前（只扣情境/前车）—— 供 GT 主口径"跟车同步"判定，口径不随物理门槛变化
+    z_ctx = np.abs(np.nan_to_num(z))      # 物理门槛前的 z，供 GT"跟车同步"判定
     z = np.where(pe, z, 0.0)
-    # v16（用户确认 2026-11-05）：减速侧改用 GT 同口径 z = min(周荣贵曲线 z, 全局 z)（Data.py → Acc_zgt），
-    #   不扣前车响应、不加文献物理门槛 —— 车队连锁急刹（跟着前车刹）也计入，模型输入能看到全部 GT 急减速。
-    #   加速侧不变（情境扣除 + 物理门槛）。
+    # 减速侧用 GT 同口径 z（Data.py → Acc_zgt），不扣前车响应、不加物理门槛，使车队连锁急刹也计入。
     if "Acc_zgt" in df:
         n_before = int(np.sum((phi_from_z(np.abs(z)) >= 1)[trusted.to_numpy() & (a < 0)]))
         z = np.where(a < 0, np.maximum(df["Acc_zgt"].to_numpy(float), 0.0), z)
         n_after = int(np.sum((phi_from_z(np.abs(z)) >= 1)[trusted.to_numpy() & (a < 0)]))
-        print(f"φ2 v16 减速侧改用 GT 同口径 z：减速 φ2=1 的可信帧 {n_before} → {n_after}")
+        print(f"φ2 减速侧用 GT 同口径 z：减速 φ2=1 的可信帧 {n_before} → {n_after}")
     phi = np.nan_to_num(phi_from_z(np.abs(z)), nan=0.0)
     t = trusted.to_numpy()
     o_raw = phi_from_z(np.abs(z_raw)) >= phi_from_z(Z_OUT); o_new = phi >= phi_from_z(Z_OUT)
@@ -285,8 +253,7 @@ def _centre_interps(df, ybin=50.0, min_n=30):
 
 
 def _centre(cs, lane, y, margin=50.0):
-    """车道中心线；超出有数据覆盖的纵向范围（±margin）返回 NaN —— 不外推。
-    （v7 抽查 #1：匝道末端车辆稀少，中心线被平推，弯道本身被算成横向偏移，φ3 饱和。）"""
+    """车道中心线；超出数据覆盖范围（±margin ft）返回 NaN，不外推（避免匝道弯道被算成横向偏移）。"""
     out = np.full(len(y), np.nan)
     lane = np.asarray(lane, float); y = np.asarray(y, float)
     for L, (yc, xc) in cs.items():
@@ -305,10 +272,9 @@ def compute_phi3(df, trusted, truck):
     sw = _lane_switches(df)
     in_lc, _ = _near_switch(df, sw, int(LC_WIN_S * FPS))
 
-    # (a) 车道保持（v8）：车道内漂移属正常，只有"压线却没有完成变道"才计分。
-    #   起点 = 正常车道保持 |偏移| 的 P99（车道×车型×500 ft 路段，变道过程外）；
-    #   终点 = 半车道宽（车身中心到车道线；用每次车道号切换前一帧相对原车道中心的 |偏移| 中位数标定）。
-    #   旧版用稳健 σ（≈0.8 ft）：偏移分布尾部很厚，车道内平缓漂移 3–4 ft 就到 φ3≈0.7，30% 的帧 φ3>0。
+    # (a) 车道保持：只有压线却未完成变道才计分。|偏移| 从正常 P99（车道×车型×路段，变道过程外）
+    #   线性增至半车道宽时为 1；半车道宽用车道号切换前一帧相对原车道中心的 |偏移| 中位数标定。
+    #   偏移分布尾部很厚，故用 P99 而非稳健 σ。
     abs_r = pd.Series(np.abs(resid), index=df.index)
     ok_keep = trusted & pd.Series(~in_lc, index=df.index)
     # 半车道宽只用主线车道之间（1/2/3）的切换标定；匝道分流处车道线位置与中心线 +半宽 不对应。
@@ -352,7 +318,7 @@ def compute_phi3(df, trusted, truck):
     med_p, s_p = np.median(peaks), robust_sigma(peaks)
     z_lat = np.nan_to_num((vlat - med_p) / s_p + 1.0, nan=0.0)
     lat = np.nan_to_num(phi_from_z(z_lat), nan=0.0)  # 一般变道峰值 → z=1 → 0
-    lat = np.where(usable, lat, 0.0)   # 中心线不可靠路段（匝道弯道/分流渐变段）横向速度同样不可信（v7 抽查 #1）
+    lat = np.where(usable, lat, 0.0)   # 中心线不可靠路段（匝道弯道/分流渐变段）横向速度同样不可信
     print(f"φ3 变道峰值横向速度: 中位数 {med_p:.2f} ft/s，σ {s_p:.2f} ft/s（{len(peaks)} 次变道）→ "
           f"φ=1 对应 {med_p + (Z_SAT - 1) * s_p:.2f} ft/s")
 
@@ -392,41 +358,14 @@ def compute_phi3(df, trusted, truck):
                  "_z": np.maximum.reduce([z_keep, np.where(usable, z_lat, 0.0), np.where(weave > 0, 99.0, 0.0)])}
 
 
-# ───────────────────────── φ4 侧向标定 ─────────────────────────
-def calibrate_lateral(df, step=15, default_len=15.0, default_wid=6.0):
-    """相邻车道、纵向车身重叠（并排）车辆的车身边缘间距分布 → (lat_safe=P1, k_lat 使 P5 处 φ=0.1)"""
-    d = df[df["Frame_ID"] % step == 0]
-    gaps = []
-    for _, g in d.groupby("Frame_ID"):
-        if len(g) < 2:
-            continue
-        x = g["Local_X"].to_numpy(float); y = g["Local_Y"].to_numpy(float)
-        w = g["Width"].fillna(default_wid).to_numpy(float); l = g["Length"].fillna(default_len).to_numpy(float)
-        L = g["Lane_Num"].to_numpy(float)
-        adx = np.abs(y[:, None] - y[None, :]) - (l[:, None] + l[None, :]) / 2
-        ady = np.abs(x[:, None] - x[None, :]) - (w[:, None] + w[None, :]) / 2
-        m = (adx < 0) & (np.abs(L[:, None] - L[None, :]) == 1)
-        np.fill_diagonal(m, False)
-        gaps.append(ady[m])
-    g = np.concatenate(gaps)
-    p1, p5, p50 = np.percentile(g, [1, 5, 50])
-    k = np.log(9.0) / max(p5 - p1, 1e-3)
-    print(f"φ4 侧向标定: 并排车身边缘间距 P1 {p1:.2f} / P5 {p5:.2f} / P50 {p50:.2f} ft（{len(g)} 对）→ "
-          f"lat_safe={p1:.2f} ft, k_lat={k:.2f}")
-    return float(p1), float(k)
-
-
 # ───────────────────────── 稀有度 z（偏斜/厚尾量用）─────────────────────────
-# 对 TTC、侧向间距这类分布极度偏斜的量，均值±σ 没有意义。改用"稀有度"：
-#   z = 使 P(正常参照 ≤ x) 等于正态分布单侧尾概率 sf(z) 的那个 z
-# 即"x 在正常驾驶中出现得和正态 zσ 以外一样少"。z ≤ Z_OUT 的范围样本充足，直接用经验分布；
-# 更极端处样本不足，用 1σ–3σ 区间上 z 与 x 的线性关系外推。
+# TTC、侧向间距等极度偏斜的量不能用均值±σ，改用稀有度：z 使 P(正常参照 ≤ x) = 正态单侧尾概率 sf(z)。
 Z_OUT = 3.0   # 拉依达 3σ 准则：|z| ≥ 3 视为离群（训练集清洗与事件核查共用）
 
 
 class RarityZ:
-    """经验分布可靠的范围（比 x 更极端的参照样本 ≥ MIN_TAIL_N 个，尾概率相对标准误 ≤ 10%）直接用经验分布；
-    更极端处用可靠范围最后 1σ 内 z 与 x 的线性关系外推（与经验段连续）。"""
+    """稀有度 z：尾部样本 ≥ MIN_TAIL_N（尾概率相对标准误 ≤ 10%）的范围用经验分布，
+    更极端处按最后 1σ 内 z 与 x 的线性关系外推（与经验段连续）。"""
     MIN_TAIL_N = 100
 
     def __init__(self, ref, name=""):
@@ -456,9 +395,8 @@ REAL_W_CAR, REAL_W_TRUCK = 6.0, 8.5   # ft：真实车宽（小汽车典型宽�
 
 
 def _side_gap(df, default_len=15.0, drop_overlap=True, verbose=True):
-    """每帧本车与相邻车道、纵向车身重叠（并排）车辆的最小车身侧向净距（ft）；无并排车 → NaN。
-    数据的 Width 是外接框（小汽车 6–12 ft、货车 8–19 ft，货车中位 13 ft 已超过车道宽 11.7 ft），
-    用它算净距会出现大量负值（P1 = −0.15 ft）。改用真实车宽后负值仅 0.02%，P0.1 ≈ 1 ft，物理上合理。"""
+    """每帧与相邻车道并排车辆的最小车身侧向净距（ft），无并排车为 NaN。
+    数据的 Width 是外接框（货车中位 13 ft 超过车道宽），故用真实车宽 REAL_W_* 计算。"""
     order = np.argsort(df["Frame_ID"].to_numpy(), kind="stable")
     fr = df["Frame_ID"].to_numpy()[order]
     x = df["Local_X"].to_numpy(float)[order]; y = df["Local_Y"].to_numpy(float)[order]
@@ -483,9 +421,8 @@ def _side_gap(df, default_len=15.0, drop_overlap=True, verbose=True):
         nb[a:b] = np.where(np.isfinite(g), vids[a:b][j], -1)
     res = np.empty(len(df)); res[order] = out
     nbr = np.empty(len(df), np.int64); nbr[order] = nb
-    # v15（2026-11-05）：并排车身重叠 —— 同一对并排车辆的一段连续并排中出现净距 ≤ 0（两车车身重叠，物理上不可能），
-    #   说明这一对的横向位置/车宽误差已超过净距本身，整段侧向净距记为缺失（与 Data.py 前车 Leader_overlap 同一规则）。
-    #   v14 复核：φ4 = 1 而无可见冲突的事件多为此类（净距 −0.2 … −1.7 ft，换道途中）。
+    # 同一对并排车辆的连续并排段中出现净距 ≤ 0（车身重叠，物理上不可能）说明位置误差超过净距，
+    # 整段记为缺失（与 Data.py 的 Leader_overlap 同一规则）。
     if drop_overlap:
         vid = df["Vehicle_ID"].to_numpy()
         fid = df["Frame_ID"].to_numpy()
@@ -513,7 +450,7 @@ THW_S0_FT = 2.0 / 0.3048    # IDM 静止最小净距 s0 = 2 m（Treiber, Henneck
 
 
 def _thw_term(df, t):
-    """→ (φ_thw, z_thw)：持续 1 s 的车头时距按速度分箱的稀有度。"""
+    """持续 1 s 的车头时距按速度分箱的稀有度，返回 (φ_thw, z_thw)。"""
     n = len(df)
     v = df["Speed_smooth"].to_numpy(float)
     gp = df["Gap_bumper"].to_numpy(float) if "Gap_bumper" in df else np.full(n, np.nan)
@@ -546,16 +483,14 @@ def _thw_term(df, t):
         with contextlib.redirect_stdout(io.StringIO()):
             rz = RarityZ(ref, "THW")
         z[sel] = rz(sus[sel])
-        # v12（用户确认 2026-11-04）：低速门槛 —— 该速度下 THW 的 3σ 对应净距（x3·v）小于静止最小净距
-        #   s0 = 2 m（IDM，Treiber et al. 2000）时，"稀有的短时距"其实只是排队停走的正常车距，不作 THW 证据。
-        #   v11 复核：v<30 ft/s 只由 THW 报出的 4 个事件全为排队正常贴近（净距 4–8 ft）。
+        # 低速门槛：3σ 对应净距（x3·v）小于静止最小净距 s0 时，短时距只是排队停走的正常车距，不计。
         low = sel & (rz.x3 * v < THW_S0_FT)
         z[low] = 0.0
         n_gate += int((low & ok).sum())
-    print(f"φ4（P10 低速门槛）: 3σ 净距 < s0={THW_S0_FT:.2f} ft 的帧 THW 项置 0：{n_gate} 帧（可信帧 {n_gate / max(ok.sum(), 1):.2%}）")
+    print(f"φ4 低速门槛: 3σ 净距 < s0={THW_S0_FT:.2f} ft 的帧 THW 项置 0：{n_gate} 帧（可信帧 {n_gate / max(ok.sum(), 1):.2%}）")
     z = np.where(np.isfinite(z), z, 0.0)
     phi = np.nan_to_num(phi_from_z(z), nan=0.0)
-    print(f"φ4（P10）: THW 项 {len(edges)} 个速度箱；持续 1 s THW 的 3σ 离群帧 {np.mean((z >= Z_OUT)[t]):.3%}，"
+    print(f"φ4: THW 项 {len(edges)} 个速度箱；持续 1 s THW 的 3σ 离群帧 {np.mean((z >= Z_OUT)[t]):.3%}，"
           f"φ=1（5σ）{np.mean((phi >= 1)[t]):.3%}")
     for vb in (30, 60, 90, 120):   # 各速度下 3σ 对应的 THW（便于核对）
         sel = ok & (np.abs(v - vb) < 5)
@@ -565,12 +500,10 @@ def _thw_term(df, t):
 
 
 def compute_phi4(df, trusted, ttc_gt=1.5, ttc_safe=TTC_SAFE):
-    """φ4 碰撞风险 = max(纵向, 侧向)。强度用物理锚点、达到危险值即饱和为 1（极端情形样本少，不再细分）：
-       纵向：同车道前车 TTC（GT 所用）。φ=1：TTC ≤ 1.5 s（严重冲突，van der Horst；FHWA SSAM，即 GT 标准）；
-             φ=0：TTC ≥ 3 s（文献中正常跟驰/交会的上界）；中间对 TTC 线性。
-             数据交叉验证：TTC 的 3σ 稀有度对应 2.41 s，落在 1.5–3 s 之间。
-       侧向：与并排车辆的真实车身净距。φ=1：净距 ≤ 0（擦碰）；φ=0：≥ 正常 1σ 稀有度对应净距；中间线性。
-       3σ 离群标记（训练清洗/核查用）仍按稀有度：TTC 或净距的稀有度 ≥ 3σ。"""
+    """φ4 碰撞风险 = max(纵向 TTC, 侧向净距, 持续 THW)。
+       纵向：TTC ≤ 1.5 s（严重冲突，FHWA SSAM，即 GT 标准）→ 1，≥ 3 s → 0，中间线性。
+       侧向：真实车身净距 ≤ 0 → 1，≥ 正常 1σ 稀有度对应净距 → 0，中间线性。
+       3σ 离群标记按稀有度：TTC、净距或 THW 的稀有度 ≥ 3σ。"""
     t = trusted.to_numpy()
     ttc = df["TTC"].to_numpy(float) if "TTC" in df else np.full(len(df), np.nan)
     ttc = np.where(np.isfinite(ttc) & (ttc > 0), ttc, np.nan)
@@ -581,12 +514,8 @@ def compute_phi4(df, trusted, ttc_gt=1.5, ttc_safe=TTC_SAFE):
     zg = RarityZ(gap[t], "侧向净距 ft")
     G1 = zg.x1
     lat = np.clip((G1 - gap) / G1, 0.0, 1.0)
-    # v11（P10，用户确认 2026-11-04）：车头时距（THW）项 —— 高速贴车跟驰时两车同速、TTC→∞，纵向 TTC 项为 0，
-    #   φ1（同速在正常区间内）也为 0；v10 复核 #37（135 ft/s 下约 30 ft）即此类。
-    #   THW = 净距 / 本车速度；持续性：取 1 s（与事件最短持续时间相同）滚动最大值，变道穿越等瞬时贴近不计；
-    #   稀有度按速度分箱（10 km/h，与加速度阈值曲线相同；样本 < MIN_BIN_FRAMES 的箱并入相邻箱）分别估计，
-    #   排队低速时的小间距不算稀有；强度用统一标度 φ = (z−1)/4（3σ 离群、5σ 饱和）。
-    #   P8 判为"横向错开中"（TTC_cleared）的帧不计。
+    # THW 项：高速同速贴车跟驰时 TTC→∞，需单独衡量。取 1 s 滚动最大值（瞬时贴近不计），
+    #   按速度分箱估计稀有度；横向错开中（TTC_cleared）的帧不计。
     thw_p, z_thw = _thw_term(df, t)
     phi = np.nan_to_num(np.fmax(np.fmax(long_, lat), thw_p), nan=0.0)
     z4 = np.fmax(np.fmax(zt(ttc), zg(gap)), z_thw); z4 = np.where(np.isfinite(z4), z4, 0.0)

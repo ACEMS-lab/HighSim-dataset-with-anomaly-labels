@@ -1,10 +1,10 @@
 """
-plot_train_curves.py —— 潜变量维度 D 的训练曲线（样式参考论文 Fig.2：训练 MSE、验证 MSE、潜变量总方差）。
+plot_train_curves.py —— 不同潜变量维度 D 的训练曲线（训练 MSE、验证 MSE、潜变量总方差）。
 
+用法：
     python tools/plot_train_curves.py runs/latentD OUT_PREFIX
-
-读 runs/latentD/D*/train_history.csv（New.stage_train 写出；train/val_mse 为纯 MSE，不含 L2 正则），
-输出 OUT_PREFIX_{train,val,var}.png 三张单图 + OUT_PREFIX_all.png 三联图。
+读 runs/latentD/D*/train_history.csv（MSE 不含 L2 正则项），
+输出 OUT_PREFIX_{train_mse,val_mse,latent_total_var}.png 三张单图及 OUT_PREFIX_all.png 三联图。
 """
 import glob
 import os

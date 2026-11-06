@@ -18,30 +18,43 @@ HighSim I-75 异常驾驶事件检测：φ1–φ4 效用特征 → GRU-AE → GM
 | 输出两层 | 模型检测层（统计对比用）：`pred_events_val_model.csv`；确认层（案例展示用）：`pred_events_val.csv` | — |
 
 GRU 的设备问题：Mac GPU（tensorflow-metal）的 GRU 算子只用一组偏置，在 GPU 上训练出的模型两组偏置相等。
-`New.zero_recurrent_bias` 按设备处理：Mac GPU 上不改权重；其他设备上把循环偏置置 0，结果与 Mac GPU 一致（差 4e-6）。
+`model.zero_recurrent_bias` 按设备处理：Mac GPU 上不改权重；其他设备上把循环偏置置 0，结果与 Mac GPU 一致（差 4e-6）。
 
 ## 2. 结果（验证集，47 个 GT）
 
 - 主模型：k = 6；模型检测 255 个事件（47/47 GT）→ 确认 92 个（45/47；漏检的 V1602、V1678 整段在速度修复区）。
 - 确认事件复核（`review_v17_final/review_list.csv`）：GT 45、真异常 17、偏异常 18、临界 6、正常 5、数据问题 1 → 异常 87%，明确误报 6.5%。
-- 基线对比：`paper_tables/table_baselines_v17.*`（所有神经网络模型用相同设置在 GPU 上训练一次）。稳健的结论：
+- 基线对比：`tables/table_baselines_v17.*`（所有神经网络模型用相同设置在 GPU 上训练一次）。稳健的结论：
   - 效用特征：φ 方法 47/47，原始特征方法最多 44/47；
   - 噪声误报（超限帧中 φ 全为 0）：φ 方法 5–10%，原始特征方法 33–63%；
   - GMM：同一 GRU-AE，全局 UCL 447 → GMM 255，召回不变。
   - GRU 与 LSTM 效果相当（不同训练间排序会互换），不声称 GRU 更优。
   - MLP-AE 对训练随机性很敏感（CPU / GPU 两次召回 0.81 / 0.23）；原始特征 GRU-AE + GMM 也有波动（0.91 / 0.81）。
-- k 敏感性：`paper_tables/table_k_sensitivity_v17.*`（k ≥ 4 时模型检测 215–255、确认 86–92、GT 不变）。
+- k 敏感性：`tables/table_k_sensitivity_v17.*`（k ≥ 4 时模型检测 215–255、确认 86–92、GT 不变）。
+
+## 2.5 代码结构
+
+| 文件 | 内容 |
+|---|---|
+| `pipeline.py` | 分阶段运行入口（data / features / train / detect / baselines） |
+| `Data.py` | 原始轨迹 → 平滑速度/加速度、TTC、数据质量标记、GT 事件 |
+| `accel_thresholds.py`、`phi1_local.py`、`utility_phi.py` | 加减速阈值曲线、局部车流速度、φ1–φ4 效用特征 |
+| `model.py` | GRU-AE 训练、GMM 驾驶状态、分类 UCL、事件化与两层输出 |
+| `report_rule.py`、`gmm_outside.py` | 事件确认（综合效用强度）、GMM 类外判断 |
+| `baselines.py` | 基线方法与两层主表 |
+| `tools/` | k 敏感性、复核图、潜空间图、SPE 柱状图、训练曲线；`relax_anchor.py`、`tail_repair_anchor.py` 为两个常数的数据锚点；`merge_aanomaly.py` 生成公开数据集的标注文件 |
+| `tables/`、`figures/` | 论文表与图 |
 
 ## 3. 论文图表
 
 | 文件 | 内容 |
 |---|---|
-| `paper_tables/table_baselines_v17.{csv,tex}` | 基线对比（两层 + 噪声误报列） |
-| `paper_tables/table_k_sensitivity_v17.{csv,tex}` | GMM 聚类数敏感性 |
-| `paper_figures/fig_latent_clusters_tsne_v17.png` | 潜空间 t-SNE（6 类；降维前加 0.01 SD 扰动打破重复点） |
-| `paper_figures/fig_latent_clusters_tsne_inside_v17.png` | 同上，只画本类 99% 稳健椭圆内的点（省略 22.8%，须写进图注） |
-| `paper_figures/fig_spe_by_cluster_v17.png` | 各驾驶状态训练帧 SPE（均值 + 1 SD） |
-| `paper_figures/fig_latent_dim_*.png` | D = 8 / 16 / 32 训练曲线 |
+| `tables/table_baselines_v17.{csv,tex}` | 基线对比（两层 + 噪声误报列） |
+| `tables/table_k_sensitivity_v17.{csv,tex}` | GMM 聚类数敏感性 |
+| `figures/fig_latent_clusters_tsne_v17.png` | 潜空间 t-SNE（6 类；降维前加 0.01 SD 扰动打破重复点） |
+| `figures/fig_latent_clusters_tsne_inside_v17.png` | 同上，只画本类 99% 稳健椭圆内的点（省略 22.8%，须写进图注） |
+| `figures/fig_spe_by_cluster_v17.png` | 各驾驶状态训练帧 SPE（均值 + 1 SD） |
+| `figures/fig_latent_dim_*.png` | D = 8 / 16 / 32 训练曲线 |
 
 驾驶状态命名：`runs/v17/cluster_names.json`（Stable Driving、Close Car-Following、Speed-Adaptive Following、Lane Changing、Dense Interactive Driving、Relaxed Following）。重训后类序号会变，须按训练集画像重新对应。
 
@@ -59,7 +72,7 @@ python pipeline.py --workdir runs/v17 --stage baselines          # 基线 + 两�
 (cd runs/v17 && python ../../tools/plot_review.py ../../review_v17_final all)
 (cd runs/v17 && PROJ=tsne MIXED=4 python ../../tools/plot_latent_clusters.py fig_latent_clusters_tsne.png 400)
 (cd runs/v17 && python ../../tools/plot_spe_by_cluster.py)
-python tools/plot_train_curves.py runs/latentD paper_figures/fig_latent_dim
+python tools/plot_train_curves.py runs/latentD figures/fig_latent_dim
 ```
 
 运行脚本：`runs/v17/v17_chain.sh`、`runs/v17/v17_planB.sh`。`runs/`、`_baseline_results_cache/`、`review_*/` 不进 git（见 `.gitignore`）。

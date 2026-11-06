@@ -1,12 +1,12 @@
 """
-report_rule.py —— 报告规则（v9b，用户确认 2026-11-04）
+report_rule.py —— 事件确认规则与 GT 读取。
 
-检测事件 = SPE 超过本类控制限、连续 ≥1 s 的帧段（模型给出"候选"）。
-报告为"异常驾驶事件"还需要：事件内至少一帧在某一维度达到 3σ（o1–o4 离群标记，3σ 拉依达准则），
-且该帧不在振铃修复区、近距离证据不在前车切入后 1.5 s 内（v10，见 evidence_cols）。
-只超 SPE、全程 <3σ 的候选（正常范围内的小波动）不报告，另存为 candidates 备查。
-
-所有方法（本文方法与各基线）用同一条报告规则；REPORT_RULE=none 可关闭（只看模型本身）。
+检测事件（候选）= SPE 超过控制限、连续 ≥1 s 的帧段。确认为异常驾驶事件需事件内至少一帧满足：
+  - 单维饱和：某维 φ = 1（5σ）；或
+  - 综合饱和：综合强度 √Σ min(z_k,5)² ≥ 阈值，阈值使超阈帧比例等于单维饱和帧比例。
+修复区帧（dq）、轨迹末端修复区、前车切入后的 φ4 不作证据。未确认的候选另存备查。
+所有方法用同一规则。环境变量：REPORT_RULE=none 关闭确认；REPORT_LEVEL=3 改用任一维 3σ 证据；
+COMBINED_CONFIRM=0 只用单维饱和；TAIL_MASK=0 不屏蔽末端修复区。
 """
 import os
 import numpy as np
@@ -16,18 +16,13 @@ O_COLS = ["o1", "o2", "o3", "o4"]
 JOINT, JOINT_THR = None, None
 
 
-# v10（P6，用户确认 2026-11-04）：轨迹末端修复区。2128/2182 条轨迹以振铃修复区结束（下游观测边界，
-# 修复为端点保持的平直速度）；修复区之前一段的速度是"真实值→保持值"的过渡，复核中 A 组 7 个数据误报有 6 个落在这里。
-# 范围由数据确定（tools/tail_repair_anchor.py）：以末端修复区起点前 3–10 s 的 3σ 帧率为远处参照，
-# 每 0.5 s 分箱的 3σ 帧率在 0–2.0 s 内为参照的 1.13–1.74 倍，2.0–2.5 s 起回到参照水平（0.95） → 前推 2.0 s。
-# 末端修复区及其前 2.0 s 的帧不作为证据（同 dq）；只影响报告规则与评估，不影响特征与训练。
-# v12：速度阶跃修复（v11）后重算锚点 → 0 s（各 0.5 s 分箱 3σ 帧率均回到参照水平，见 runs/v11/anchor_tail.txt），
-#   按"阈值须有数据锚点"关闭前推（只保留末端修复区本身不作证据，与 dq 相同）。
+# 末端修复区之前额外不作证据的帧数。数据锚点（tools/tail_repair_anchor.py）：修复区之前各 0.5 s 分箱的
+# 3σ 帧率与远处参照无差异，故取 0。只影响事件确认与评估，不影响特征与训练。
 TAIL_PRE_FRAMES = 0
 
 
 def add_tail(df):
-    """加列 tail_rz：每辆车最后一段 dq（延伸到该车最后一帧）及其前 TAIL_PRE_FRAMES 帧 = 1。须传入整车数据。"""
+    """加列 tail_rz：每辆车末端修复区（延伸到最后一帧的 dq 段）及其前 TAIL_PRE_FRAMES 帧为 1。须传入整车数据。"""
     d = df[["Vehicle_ID", "Frame_ID"]].copy()
     d["dq"] = df["dq"].fillna(0).astype(int).to_numpy() if "dq" in df else 0
     d = d.sort_values(["Vehicle_ID", "Frame_ID"])
@@ -43,12 +38,10 @@ def add_tail(df):
 
 
 def evidence_cols(df):
-    """逐帧、逐维度的"可作证据"的 3σ 标记（v10）：
-    - 振铃修复区（dq=1）的帧：任何维度都不作为证据（速度是重建值，边界处有阶跃）
-    - 前车切入后 1.5 s 内（cutin=1）：近距离 o4 视为他车引起，不作为本车证据
-    - 轨迹末端修复区及其前 2.0 s（tail_rz，P6；TAIL_MASK=0 关闭）：任何维度都不作为证据
-    注意：tail_rz 须在整车数据上计算——传入切片前先调用 add_tail。
-    返回与 O_COLS 同名的 0/1 DataFrame。"""
+    """逐帧、逐维度可作证据的 3σ 标记，返回与 O_COLS 同名的 0/1 DataFrame。
+    修复区（dq=1，速度为重建值）和末端修复区（tail_rz）的帧各维都不作证据；
+    前车切入后 1.5 s 内（cutin=1）的 o4 视为他车引起，不作证据。
+    tail_rz 须在整车数据上计算，传入切片前先调用 add_tail。"""
     E = df[[c for c in O_COLS if c in df.columns]].fillna(0).astype(int).copy()
     dq = df["dq"].fillna(0).astype(int) if "dq" in df else 0
     E = E.mul(1 - dq, axis=0) if "dq" in df else E
@@ -63,29 +56,24 @@ def evidence_cols(df):
 
 
 def rule_on():
-    return os.environ.get("REPORT_RULE", "on").lower() != "none"   # v16（用户确认 2026-11-05）：用 5σ 证据规则（REPORT_LEVEL 默认 5）；REPORT_RULE=none 看模型全部输出
+    return os.environ.get("REPORT_RULE", "on").lower() != "none"   # REPORT_RULE=none：不做确认，看模型全部输出
 
 
 def load_oflags(path="phi_all.csv"):
-    """每辆车：排好序的帧号 + "任一维度 3σ 离群"的累计和，用于 O(log n) 判断区间内是否有证据帧。"""
+    """每辆车：排好序的帧号 + 确认证据帧的累计和，用于 O(log n) 判断区间内是否有证据帧。"""
     P = ["phi1", "phi2", "phi3", "phi4"]
     Zc = ["z1", "z2", "z3", "z4"]
     df = pd.read_csv(path, usecols=lambda c: c in ["Vehicle_ID", "Frame_ID", "dq", "cutin"] + O_COLS + P + Zc)
     if os.environ.get("TAIL_MASK", "1") == "1" and "dq" in df:
         df = add_tail(df)
     ev = evidence_cols(df)
-    # v15（2026-11-05，目标：报告事件大部分为真异常）：报告证据须达到 5σ —— 证据帧中该维度 φ = 1（统一标度 5σ 饱和，
-    #   与 GT 的 5σ 同一锚点）。v14 全量复核：只有 3σ 证据的事件 98 个中真异常 5 个（5%）；有 5σ 证据的 36 个中 12 个（33%）。
-    #   REPORT_LEVEL=3 恢复旧规则（任一维度 3σ）。
+    # 单维饱和：证据帧中该维 φ = 1（φ 在 5σ 处饱和，与 GT 的 5σ 同一锚点）。REPORT_LEVEL=3 改用任一维 3σ。
     if os.environ.get("REPORT_LEVEL", "5") == "5" and all(p in df for p in P):
         strong = np.column_stack([(df[p].to_numpy() >= 1 - 1e-9) for p in P])
         ev = ev & strong[:, [O_COLS.index(c) for c in ev.columns]]
         sat = (ev.max(axis=1) > 0).to_numpy()
-        # v16b（用户确认 2026-11-05）：事件确认 = 单维饱和 或 综合饱和。单维都未饱和、但几个维度同时偏高的组合异常
-        #   （v16 复核：蛇行、变道切入慢车队并急减速、急减速逼近前车等，12 个中约 9 个为真异常）也确认。
-        #   综合强度 = sqrt(Σ min(z_k,5)²)（各维 z 截断于 5σ，与 φ=1 同一上限；不可信帧不计，同 evidence_cols）。
-        #   阈值（数据锚点）：在未单维饱和的可信帧中，取使超阈帧比例等于单维饱和帧比例的分位数 → 综合饱和与单维饱和同样罕见。
-        #   COMBINED_CONFIRM=0 关闭（只用单维饱和）。
+        # 综合饱和：各维都未饱和、但多维同时偏高的组合异常也确认。综合强度 = √Σ min(z_k,5)²（不可信帧不计）；
+        #   阈值取未单维饱和的可信帧中使超阈比例等于单维饱和帧比例的分位数，使两类确认同样罕见。
         if os.environ.get("COMBINED_CONFIRM", "1") == "1" and all(z in df for z in Zc):
             trust = np.ones(len(df), bool)
             if "dq" in df:
@@ -93,9 +81,8 @@ def load_oflags(path="phi_all.csv"):
             if "tail_rz" in df:
                 trust &= df["tail_rz"].fillna(0).to_numpy() == 0
             Zr = df[Zc].fillna(0).to_numpy(float)
-            # v16b 修正（2026-11-05 复核）：φ3 蛇行（A→B→A 回头变道）在 z3 中记为占位值 99（= "≥3σ 离群"标记），
-            #   其强度已按回头间隔分级在 φ3 里。截断成 5 会把每次回头变道都当 5σ，平稳的"变出又变回"也被确认
-            #   （V1258/V1362/V918 等）。改用 φ3 对应的等价 z：z = 1 + (Z_SAT−1)·φ3（utility_phi.phi_from_z 的反函数）。
+            # 蛇行（回头变道）在 z3 中是占位值 99，强度已按回头间隔分级在 φ3 里；直接截断为 5 会把每次回头变道都当 5σ。
+            #   改用 φ3 的等价 z = 1 + 4·φ3（utility_phi.phi_from_z 的反函数）。
             if "phi3" in df:
                 w = Zr[:, 2] >= 98
                 Zr[w, 2] = 1.0 + 4.0 * df["phi3"].to_numpy(float)[w]
@@ -107,7 +94,7 @@ def load_oflags(path="phi_all.csv"):
             rate = sat[trust].mean()
             thr = float(np.quantile(comb[trust & ~sat], 1 - rate))
             csat = trust & (comb >= thr)
-            global JOINT, JOINT_THR   # 供复核图"证据"面板使用：每帧综合强度、是否单维饱和、阈值
+            global JOINT, JOINT_THR   # 供作图使用：每帧综合强度、是否单维饱和、阈值
             JOINT = df[["Vehicle_ID", "Frame_ID"]].assign(joint=comb, single_sat=sat.astype(int))
             JOINT_THR = thr
             print(f"[事件确认] 单维饱和帧 {rate:.4%}；综合强度阈值 {thr:.2f}（同频率）；"
@@ -123,6 +110,7 @@ def load_oflags(path="phi_all.csv"):
 
 
 def has_evidence(events, of):
+    """每个事件区间内是否有证据帧（of 为 load_oflags 的输出）。"""
     if events is None or len(events) == 0:
         return np.zeros(0, bool)
     out = np.zeros(len(events), bool)
@@ -137,7 +125,7 @@ def has_evidence(events, of):
 
 
 def split_events(events, of):
-    """→ (reported, candidates)"""
+    """按是否含证据帧把事件分为 (reported, candidates)。"""
     if events is None or len(events) == 0:
         return events, events
     k = has_evidence(events, of)
@@ -160,17 +148,16 @@ def mask_frames(df_frame, reported):
     return d
 
 
-# ── GT 口径（v10，用户确认 2026-11-04）──────────────────────────────────────────
-# 主口径：急加减速 GT（原始加速度 ±5σ）中，"跟车同步"的不算异常 —— 事件内本车加速度扣掉前车近期
-# 加速度范围后（φ2 的 z2，见 utility_phi.compute_phi2）从未达到 3σ（o2 全为 0），即本车只是跟着前车加减速。
-# 与 TTC 冲突重叠的事件（gt_type 含 ttc）保留。原口径（全部 GT）同时报告，作敏感性分析。
+# ── GT ──────────────────────────────────────────────────────────────────────
+# "跟车同步急加减速"：事件内本车加速度扣掉前车近期加速度范围后（z2）从未达 3σ，即只是跟着前车加减速。
+# GT_SYNC=keep（默认）时不剔除；否则主口径剔除这类事件，原口径作敏感性分析。
 GT_PATH = "HighSim_events_Anomaly30_merge2s.csv"
 
 
 def gt_sync_follow(gt, phi_path="phi_all.csv"):
     """→ bool 数组：该 GT 事件是否为"跟车同步急加减速"。"""
     cols = pd.read_csv(phi_path, nrows=0).columns
-    oc = "o2ctx" if "o2ctx" in cols else "o2"   # v14：用未加物理门槛的情境 3σ 标记，主口径不随 φ2 门槛变化
+    oc = "o2ctx" if "o2ctx" in cols else "o2"   # 用未加物理门槛的情境 3σ 标记，GT 不随 φ2 门槛变化
     ph = pd.read_csv(phi_path, usecols=["Vehicle_ID", "Frame_ID", oc]).rename(columns={oc: "o2"})
     of = {int(v): (g["Frame_ID"].to_numpy(np.int64), np.concatenate([[0], np.cumsum(g["o2"].fillna(0).to_numpy())]))
           for v, g in ph.sort_values(["Vehicle_ID", "Frame_ID"]).groupby("Vehicle_ID")}
@@ -179,36 +166,19 @@ def gt_sync_follow(gt, phi_path="phi_all.csv"):
 
 
 def load_gt(path=GT_PATH, phi_path="phi_all.csv"):
-    """→ (gt_main, gt_orig)。gt_main 去掉跟车同步急加减速；GT_SYNC=keep 时两者相同。"""
+    """→ (gt_main, gt_orig)。GT_SYNC=keep（默认）时两者相同；否则 gt_main 去掉跟车同步急加减速，并写出 *_flagged.csv。"""
     gt = pd.read_csv(path, low_memory=False)
-    if os.environ.get("GT_SYNC", "keep").lower() == "keep":   # v16：GT 不再扣"跟车同步"
+    if os.environ.get("GT_SYNC", "keep").lower() == "keep":
         return gt, gt
     m = gt_sync_follow(gt, phi_path)
     gt.assign(sync_follow=m.astype(int)).to_csv(path.replace(".csv", "_flagged.csv"), index=False)
     return gt[~m].reset_index(drop=True), gt
 
 
-# v12（用户确认 2026-11-04）：复核后 GT —— 验证集全部主口径 GT 事件逐个复核（tools/plot_review.py OUT gt），
-#   复核为 NORMAL（情境可解释的正常加减速）或 DATA（数据伪影）的事件去掉，只留确定的异常。
-#   清单文件 gt_review_exclude.csv（Vehicle_ID,start_frame,end_frame,label,reason）放在工作目录。
-GT_EXCLUDE_PATH = "gt_review_exclude.csv"
-
-
-def load_gt_verified(path=GT_PATH, phi_path="phi_all.csv", exclude_path=GT_EXCLUDE_PATH):
-    """→ 复核后 GT（主口径去掉复核为 NORMAL/DATA 的事件）；无清单文件时返回 None。"""
-    if not os.path.exists(exclude_path):
-        return None
-    gt_main, _ = load_gt(path, phi_path)
-    ex = pd.read_csv(exclude_path)
-    key = set(zip(ex.Vehicle_ID.astype(int), ex.start_frame.astype(int)))
-    m = np.array([(int(v), int(s)) in key for v, s in zip(gt_main.Vehicle_ID, gt_main.start_frame)], bool)
-    print(f"复核后 GT：主口径 {len(gt_main)} − 复核去掉 {int(m.sum())} = {int((~m).sum())}")
-    return gt_main[~m].reset_index(drop=True)
-
 
 def load_gt_phys(path=GT_PATH, phi_path="phi_all.csv"):
-    """v14（用户确认 2026-11-05，方案 2 的第二口径）：物理锚点 GT —— 主口径中 TTC 冲突全部保留；
-    急加/减速只保留"情境 5σ 且超出物理锚点（AASHTO 3.4 m/s² 减速；Long 2000 加速 2.2/1.5 m/s²）持续 ≥1 s"的事件。"""
+    """物理锚点 GT：TTC 冲突全部保留；急加/减速只保留情境 5σ 且超出物理锚点
+    （AASHTO 减速 3.4 m/s²；Long 2000 加速 2.2/1.5 m/s²）持续 ≥1 s 的事件。无 phys_harsh 列时返回 None。"""
     gt_main, _ = load_gt(path, phi_path)
     if "phys_harsh" not in gt_main.columns:
         return None

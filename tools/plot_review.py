@@ -1,17 +1,15 @@
 """
-plot_review.py —— 人工复核抽样图（英文、简化）。在 runs/<run> 目录下运行：
+plot_review.py —— 验证集事件的人工复核图，每个事件一张。
 
-    python ../../tools/plot_review.py OUT_DIR [N_PER_GROUP=15] [SEED=11]
-
-抽样三组（均为验证集、未命中 GT 的事件）：
-  A  只有模型报告（与纯 3σ 规则事件不重叠）
-  B  只有纯 3σ 规则报告（模型未报）
-  C  两者都报告
-每个事件一张图：
-  上半部分（物理量）：Bird's Eye View；Speed；Longitudinal Acceleration（虚线 = GT 5σ 阈值）；
-                      Lateral Position；Headway & TTC（虚线 = 1.5 s / 3 s）
-  下半部分（模型）：SPE 与 UCL（超限段红色）；Utility value φ1–φ4
-输出：OUT_DIR/NN_<group>_veh<id>.png、review_list.csv、index.html
+用法（在 runs/<run> 目录下）：
+    python ../../tools/plot_review.py OUT_DIR [N_PER_GROUP=15|all|gt] [SEED=11]
+  数字：每组随机抽样 —— A 仅模型报告、B 仅 3σ 规则报告、C 两者都报告（非 GT）、
+        D 退化类改用合并 UCL 后不再报告的事件（需 pred_events_val_q099_pooled.csv）；
+  all：全部报告事件（G 与 GT 重叠、N 不在 GT 中）；
+  gt：全部 GT 事件（不显示是否检出，避免复核偏向）。
+图中上半为物理量（鸟瞰、速度、加速度及 GT 5σ 阈值、横向位置、车距/TTC/侧向净距），
+下半为模型量（SPE 与 UCL、φ1–φ4、事件确认的综合强度）。
+输出：OUT_DIR/NNN_<group>_veh<id>.png、review_list.csv、index.html
 """
 import os
 import sys
@@ -26,7 +24,7 @@ from matplotlib.gridspec import GridSpec
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, ".."))
-import exper_fixed as ef          # noqa: E402
+import baselines as ef          # noqa: E402
 import report_rule as rr          # noqa: E402
 import accel_thresholds as at     # noqa: E402
 
@@ -37,9 +35,9 @@ P = ["phi1", "phi2", "phi3", "phi4"]
 PHI_STYLE = [("phi1", "φ1 Speed", "#a6c8e6"), ("phi2", "φ2 Acc", "#f0b46a"),
              ("phi3", "φ3 Lane", "#a9a9a9"), ("phi4", "φ4 Collision", "#7b4fb0")]
 DN = ["speed", "accel", "lateral", "proximity"]
-GROUP = {"A": "Model only", "B": "3σ rule only", "C": "Both", "D": "Dropped if low-UCL cluster used pooled UCL (P5)",
+GROUP = {"A": "Model only", "B": "3σ rule only", "C": "Both", "D": "Dropped if low-UCL cluster used pooled UCL",
          "G": "Reported, matches GT", "N": "Reported, not in GT", "T": "Ground-truth event"}
-PAD = 90  # 3 s before/after
+PAD = 90  # 事件前后各 3 s
 
 
 def overlaps(a, b):
@@ -60,7 +58,7 @@ def main(out_dir, n=15, seed=11):
     gt = rr.load_gt()[0]   # 主口径 GT（去掉跟车同步急加减速）
     ph = pd.read_csv("phi_all.csv")
     ph = ph[ph.Vehicle_ID.isin(val)].sort_values(["Vehicle_ID", "Frame_ID"]).reset_index(drop=True)
-    rr.load_oflags("phi_all.csv")          # v16b：事件确认的综合强度（证据面板）
+    rr.load_oflags("phi_all.csv")          # 载入事件确认的综合强度（证据面板用）
     if rr.JOINT is not None:
         ph = ph.merge(rr.JOINT, on=["Vehicle_ID", "Frame_ID"], how="left")
     E = rr.evidence_cols(ph)
@@ -71,18 +69,16 @@ def main(out_dir, n=15, seed=11):
     A = ev[~overlaps(ev, r3)]
     B = r3[~overlaps(r3, ev)]
     C = ev[overlaps(ev, r3) & ~overlaps(ev, gt)]
-    # P5（只用于复核评估，主流程不改）：退化类（φ 全 0 窗口过半）改用合并 UCL 后不再报告的事件 → 单独抽一组 D，看它们是否为误报
+    # D 组：退化类（φ 全 0 窗口过半）改用合并 UCL 后不再报告的非 GT 事件
     D = ev.iloc[0:0]
     if os.path.exists("pred_events_val_q099_pooled.csv"):
         pooled = pd.read_csv("pred_events_val_q099_pooled.csv")
         D = ev[~overlaps(ev, pooled) & ~overlaps(ev, gt)]
         p5_drop_all = int((~overlaps(ev, pooled)).sum())
-        print(f"P5：主流程报告 {len(ev)}，退化类（φ 全 0 窗口过半）改用合并 UCL 后报告 {len(pooled)}，不再报告 {p5_drop_all}（其中非 GT {len(D)}）")
+        print(f"退化类合并 UCL：主流程报告 {len(ev)}，退化类（φ 全 0 窗口过半）改用合并 UCL 后报告 {len(pooled)}，不再报告 {p5_drop_all}（其中非 GT {len(D)}）")
     print({"A_model_only": len(A), "B_rule_only": len(B), "C_both_nonGT": len(C), "D_P5_dropped": len(D)})
     rng = np.random.default_rng(seed)
     pick = []
-    # n = "all"：全部报告事件逐个出图（G = 与 GT 重叠，N = 不在 GT 中），用于全量复核
-    # n = "gt"：验证集全部主口径 GT 事件逐个出图（不显示是否被检出，避免复核偏向），用于"复核后 GT"
     if n == "gt":
         gv = gt[gt.Vehicle_ID.isin(val)]
         groups = [("T", gv)]
@@ -105,7 +101,7 @@ def main(out_dir, n=15, seed=11):
     cols = ["Vehicle_ID", "Frame_ID", "Local_X", "Local_Y", "Lane_Num", "Speed_smooth", "Acc_from_vsmooth_g",
             "Leader_ID", "Gap_bumper", "Preceding_Speed", "TTC", "is_truck", "Length"]
     fr = pd.read_csv("HighSim_frames_with_Anomaly30.csv", usecols=lambda c: c in cols)
-    # v15：侧向净距（φ4 侧向项，与 utility_phi._side_gap 相同算法）—— 只在各事件窗口涉及的帧上计算，画在 TTC 轴上
+    # 侧向净距（utility_phi._side_gap），只在事件窗口涉及的帧上计算
     import utility_phi as up
     need = set()
     for e in pick.itertuples():
@@ -168,7 +164,7 @@ def main(out_dir, n=15, seed=11):
         grp = int(at.group_id(pd.Series([truck]), pd.Series([me.Lane_Num.mode().iloc[0]]))[0])
         for side, sgn in (("acc", 1), ("dec", -1)):
             t1 = at.threshold(curves, grp, side, 1, v_ev); t2 = at.threshold(curves, grp, side, 2, v_ev)
-            thr = float(t1 + 4 * (t2 - t1))       # z = 5（GT）
+            thr = float(t1 + 4 * (t2 - t1))       # z = 5（GT 阈值）
             ax.axhline(sgn * thr, color="#d62728", ls=":", lw=1, label=f"{sgn * thr:+.2f} g (GT 5σ, steady state)")
         shade(ax, 0, te)
         ax.set_title("Longitudinal Acceleration"); ax.set_xlabel("Time (s)"); ax.set_ylabel("Acceleration (g)")
@@ -211,7 +207,7 @@ def main(out_dir, n=15, seed=11):
         ax.axvspan(0, te, color="#f6d8b8", alpha=0.6, lw=0)
         ax.set_ylim(-0.03, 1.05); ax.set_ylabel("Utility value"); ax.set_xlabel("Time (s)")
         ax.legend(loc="upper right", ncol=4); ax.set_title("Utility features (dotted: 3σ)")
-        # ── 证据：事件确认用的综合效用强度（v16b） ──
+        # ── 证据：事件确认用的综合效用强度 ──
         confirmed = None
         if "joint" in me and rr.JOINT_THR is not None:
             ax = fig.add_subplot(gs[5, :])

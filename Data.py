@@ -1,5 +1,11 @@
+"""
+Data.py —— HighSim 轨迹预处理与 GT 事件生成。
 
-
+流程：读取原始轨迹 → 速度修复与加速度（1 s 速度差分）→ 数据质量标记（Edge / BadTrack /
+BadVehicle / 速度修复区）→ 基于位置的前车与 TTC → 逐帧异常标注 → 持续时间过滤 → 事件化。
+GT：急减速 min(周荣贵 2024 速度-阈值曲线 z, 全局 z) ≥ GT_ACC_Z；同车道 TTC < TTC_SEV_S；均持续 ≥ GT_MIN_S。
+单位：ft、ft/s、ft/s²；g = ft/s² ÷ 32.174。主要入口：main。
+"""
 import os
 import numpy as np
 import pandas as pd
@@ -12,66 +18,57 @@ import matplotlib.pyplot as plt
 G_FTPS2           = 32.174   # 1g = 32.174 ft/s²
 FPS               = 30       # 帧率
 
-# ── GT（高置信度参考集）──────────────────────────────────────────
-# 只收两类有客观物理标准的"明显异常"，并剔除疑似重建噪声：
-#  1) 极端急加/减速：按 周荣贵等(2024) 的速度-阈值三次曲线（分车型），z >= GT_ACC_Z 持续 >= GT_MIN_S
-#     （原文 z>=2 为"极端异常"，在本数据上占 63% 车辆，过宽；此处取 z>=5 作为"确定异常"）
-#  2) 严重追尾冲突：TTC < TTC_SEV_S 持续 >= GT_MIN_S，且前车与本车同车道
-#  剔除：事件内原始 Acceleration 饱和(±20 ft/s²)帧 > 50% 且无邻车同时变速印证 → 视为重建噪声
+# ── GT ─────────────────────────────────────────────────────────
+# 急减速：z ≥ GT_ACC_Z（原文 z ≥ 2 为极端异常，在本数据上过宽，取 5σ 作为确定异常）；
+# TTC 冲突：TTC < TTC_SEV_S 且前车同车道。两者均须持续 ≥ GT_MIN_S。
 GT_ACC_Z          = 5.0
-GT_MIN_S          = 1.0
-HARD_BRAKE_G      = -0.65    # SHRP2 文献阈值，仅用于打印对照，不再用于 GT
+GT_MIN_S          = 1.0      # s
+HARD_BRAKE_G      = -0.65    # SHRP2 文献阈值，仅打印对照
 HARD_ACCEL_G      =  0.58
 TTC_CRIT_S        =  3.0     # 仅统计
-TTC_SEV_S         =  1.5     # severe conflict 阈值（SSAM/FHWA）
+TTC_SEV_S         =  1.5     # 严重冲突阈值，s（SSAM/FHWA）
+# 重建噪声剔除：急变速段内原始加速度饱和帧占比 > NOISE_SAT_FRAC 且无邻车印证则剔除。
+# 邻车印证 = 同车道 ±NB_DY_FT (ft) 内、同时段速度变化 > NB_DV_FTPS (ft/s) 的车辆。
 NOISE_SAT_FRAC    =  0.5
 NB_DY_FT          = 400.0
 NB_DV_FTPS        = 15.0
-# 数据方的 Speed 每帧变化被限制在 ±20 ft/s²（全数据没有一帧超过，3.3% 的帧正好卡在上限）。
-# 1 s 加速度 = ±20 ft/s²(0.622 g) 说明整整 1 s 都被截断：真实值 ≥ 0.62 g，或是重建伪影。
-# 含截断帧的急加/减速段要求更强的邻车印证（≥ NB_MIN_CAPPED 辆邻车同时变速）才保留。
+# 数据方将每帧速度变化截断在 ±20 ft/s²；1 s 加速度达到上限说明整 1 s 被截断（真实急变速或重建伪影），
+# 这类段需至少 NB_MIN_CAPPED 辆邻车印证才保留。
 ACC_CAP_FTPS2     = 19.99
 NB_MIN_CAPPED     = 2
 
-# ── 平滑链（避免重复平滑）─────────────────────────────────────
-# 原始 Speed 列已由数据方按 2 s 滑动平均计算（数据说明 data_description2026），二阶差分噪声
-# 仅 ~0.2 ft/s，已足够平滑。旧版在其上再做 SG(51 帧≈1.7 s) 属于重复平滑，会把 0.38 g 的峰值压到 0.34 g。
-# 现在：SG_WINDOW = None → Speed_smooth 直接取原始 Speed；加速度 = 1 s 速度差 / 时间差。
-# 有效平滑 ≈ 数据方 2 s 滑动平均 + 1 s 差分。若改用其他数据源，可把 SG_WINDOW 设为奇数帧数重新启用。
+# ── 平滑 ───────────────────────────────────────────────────────
+# 原始 Speed 已由数据方做 2 s 滑动平均，再做 SG 平滑会压低峰值，故 SG_WINDOW = None（不再平滑）。
+# 换用其他数据源时可设为奇数帧数启用 SG 平滑。
 SG_WINDOW         = None
 SG_POLYORDER      = 2
 
-MIN_CONSEC_FRAMES     = int(round(GT_MIN_S * 30))   # 急加/减速连续帧下限（1 s）
-MIN_CONSEC_FRAMES_TTC = int(round(GT_MIN_S * 30))   # TTC 冲突连续帧下限（1 s）
-MERGE_GAP_S       = 2.0      # 事件合并间隔（秒）
-CONTEXT_EXPAND_S  = 1.0      # 事件前后扩展（秒）
+MIN_CONSEC_FRAMES     = int(round(GT_MIN_S * 30))   # 急变速连续帧下限
+MIN_CONSEC_FRAMES_TTC = int(round(GT_MIN_S * 30))   # TTC 冲突连续帧下限
+MERGE_GAP_S       = 2.0      # 事件合并间隔，s
+CONTEXT_EXPAND_S  = 1.0      # 事件前后扩展，s
 
-# ── 去噪 / 数据质量 ─────────────────────────────────────────────
-# 轨迹首尾帧：SG 窗口不完整(mode="interp" 外推) + 视频边缘跟踪截断，
-# 加速度在这里会出现 >1g 的伪尖峰。首尾各 EDGE_TRIM_FRAMES 帧标记为 Edge=1，
-# 不参与 GT 标注，也不参与模型训练/检测（见 New.py）。
-# 数据方 2 s 滑动平均在轨迹两端各约 1 s 不完整，再加 1 s 差分的半窗 0.5 s → 首尾各 1.5 s
+# ── 数据质量 ───────────────────────────────────────────────────
+# 轨迹首尾各 1.5 s 标记为 Edge（2 s 滑动平均在两端各约 1 s 不完整，加 1 s 差分半窗 0.5 s），
+# 这些帧不参与 GT 标注和模型训练/检测。
 EDGE_TRIM_FRAMES  = 45
-# 乘用车物理上限约 1g；超过视为跟踪误差（BadTrack=1），不作为异常标注
-MAX_PLAUSIBLE_G   = 1.0
-EXTRAP_MIN_FRAMES = 90     # 3 s
-EXTRAP_MIN_SPEED  = 5.0    # ft/s：停车时速度恒为 0 不算
-# HighSim 原始 Acceleration 被重建算法限制在 ±20 ft/s²（量化步长 0.439）。
-# 个别轨迹长时间处于 ±20 来回饱和（"bang-bang"，速度 55↔130 ft/s 锯齿振荡），属重建失败。
-# 全体车辆饱和帧占比 P99≈5.8%；占比 > BAD_VEH_SAT_FRAC 的车辆整车标记 BadVehicle=1。
+MAX_PLAUSIBLE_G   = 1.0      # 超过视为跟踪误差（BadTrack）
+EXTRAP_MIN_FRAMES = 90       # 速度连续不变 ≥ 3 s 视为外推假轨迹
+EXTRAP_MIN_SPEED  = 5.0      # ft/s，排除停车
+# 原始 Acceleration 被重建算法限制在 ±20 ft/s²；饱和帧占比 > BAD_VEH_SAT_FRAC 的车辆
+# 整车标记 BadVehicle（全体车辆该占比 P99 ≈ 5.8%）。
 RAW_ACC_BOUND     = 20.0
 BAD_VEH_SAT_FRAC  = 0.15
 LEADER_LAT_TOL_FT = 6.0      # 前车判定：横向中心距 < 半车道宽（12 ft 车道）
-LAT_SEP_FRAMES    = 15       # v11 P8：横向分离速度差分步长（0.5 s）
-# 加速度 = 速度差 / 时间差（中心差分，前后各 ACC_HALF_FRAMES 帧，共 1 s）。
-# 不使用原始 Acceleration 列：它被重建算法限制在 ±20 ft/s² 且量化、常来回饱和。
+LAT_SEP_FRAMES    = 15       # 横向分离速度的差分步长（0.5 s）
+# 加速度 = 中心差分（前后各 ACC_HALF_FRAMES 帧，共 1 s）；不用原始 Acceleration 列（截断、量化、常饱和）。
 ACC_HALF_FRAMES   = 15
-TRUCK_CLASS       = 3        # 新版 HighSim (20260601) 起 Class: 2=小汽车, 3=货车
+TRUCK_CLASS       = 3        # Class：2 = 小汽车，3 = 货车
 
 id_col    = "Vehicle_ID"
 time_col  = "Global_Time"
 frame_col = "Frame_ID"
-speed_col = "Speed"          # 原始速度（ft/s）；加速度由 SG deriv=1 直接对其求导
+speed_col = "Speed"          # 原始速度，ft/s
 
 
 # =========================
@@ -88,8 +85,7 @@ def load_and_filter(csv_path: str) -> pd.DataFrame:
     for c in cols:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # 新版 HighSim_Data_20260601.csv 的第 7/8 列与旧版相反（新版为 Length, Width；
-    # 说明文档仍写 Width 在前）。按"车长 > 车宽"自动识别并纠正。
+    # 第 7/8 列顺序在不同版本数据中不一致，按"车长 > 车宽"识别并纠正
     if df["Width"].median() > df["Length"].median():
         df = df.rename(columns={"Width": "Length", "Length": "Width"})
         print("检测到新版列顺序（第 7 列为车长），已交换 Width/Length")
@@ -104,16 +100,15 @@ def load_and_filter(csv_path: str) -> pd.DataFrame:
 
 
 # =========================
-# 2) 加速度：SG deriv=1 对原始 Speed 直接求导
+# 2) 速度修复与加速度
 # =========================
 def _make_odd(n: int) -> int:
     return n if n % 2 == 1 else n - 1
 
 
 def _acc_for_vehicle(g: pd.DataFrame) -> np.ndarray:
-    """加速度 = 速度差 / 时间差：a(t) = [v(t+h) - v(t-h)] / [T(t+h) - T(t-h)]，h = ACC_HALF_FRAMES。
-    v 为 SG 平滑后的速度 Speed_smooth，T 为 Global_Time。轨迹两端 h 帧内退化为单侧差分
-    （这些帧本就被 Edge 标记剔除）。"""
+    """加速度 a(t) = [v(t+h) − v(t−h)] / [T(t+h) − T(t−h)]，h = ACC_HALF_FRAMES，v 为 Speed_smooth。
+    轨迹两端退化为单侧差分（这些帧已被 Edge 剔除）。"""
     v = g["Speed_smooth"].to_numpy(dtype=float)
     t = g[time_col].to_numpy(dtype=float)
     n = len(v)
@@ -128,12 +123,11 @@ def _acc_for_vehicle(g: pd.DataFrame) -> np.ndarray:
     return np.nan_to_num(acc, nan=0.0, posinf=0.0, neginf=0.0)
 
 
-# ── 速度"振铃"（锯齿）修复 ─────────────────────────────────────────
-# 数据方把每帧速度变化截断在 ±20 ft/s²。速度估计出现阶跃（真实急变速或跟踪跳变）时，截断后的速度
-# 会在 ±20 之间来回振荡、幅度递减（例：-24,+14,-15,+8,-8 帧交替顶格），形成三角形锯齿。
-# 全数据约 4% 的帧、lane 0 约 20% 的帧有此现象；它不全是噪声（多车同时出现时是真实减速波），
-# 所以不删除，而是修复：在振铃段内用段前、段后速度线性插值，保留净速度变化、去掉来回振荡。
-# 振铃 = 顶格段（|a|≥19.99 且连续 ≥RING_MIN_RUN 帧）正负交替 ≥RING_MIN_CHAIN 次、相邻段间隔 ≤RING_GAP 帧。
+# ── 速度振铃（锯齿）修复 ───────────────────────────────────────
+# 速度阶跃经 ±20 ft/s² 截断后会在正负上限间来回振荡（锯齿）。振荡不全是噪声，故不删除，
+# 而在振铃段内用段前、段后速度线性插值，保留净速度变化。
+# 振铃 = 顶格段（|a| ≥ ACC_CAP_FTPS2 且连续 ≥ RING_MIN_RUN 帧）正负交替 ≥ RING_MIN_CHAIN 次、
+# 相邻段间隔 ≤ RING_GAP 帧；修复范围向两侧各扩展 RING_PAD 帧。
 RING_MIN_RUN   = 2
 RING_GAP       = 15
 RING_MIN_CHAIN = 3
@@ -141,6 +135,7 @@ RING_PAD       = 15
 
 
 def ringing_mask(a_raw: np.ndarray) -> np.ndarray:
+    """由原始加速度标记振铃段（含两侧 RING_PAD 帧）。"""
     s = np.where(np.abs(a_raw) >= ACC_CAP_FTPS2, np.sign(a_raw), 0)
     n = len(s); flag = np.zeros(n, bool); runs = []; i = 0
     while i < n:
@@ -164,12 +159,9 @@ def ringing_mask(a_raw: np.ndarray) -> np.ndarray:
     return flag
 
 
-# v11（用户确认 2026-11-04）：速度阶跃 —— 不成链的孤立顶格段（|a|≥19.99 连续 ≥RING_MIN_RUN 帧、≤RING_GAP 帧，
-# 不属于振铃链）。v10 全量复核中 21 个"数据问题"是这种阶跃：0.2–0.3 s 内速度跳 4–6 ft/s 后又部分回弹，
-# 前后加速度只有 0.02–0.15 g（例 1589：125→119→121 ft/s），是跟踪修正而非真实变速。
-# 与振铃同样处理：段 ±RING_PAD 内线性插值（保留净速度变化），并计入修复区（证据不计入）。
-# 顶格超过 RING_GAP 帧（>0.5 s）的持续顶格视为真实急变速，不修复；单帧顶格（15686 处）与振铃定义一样忽略。
 def step_mask(a_raw: np.ndarray, ring: np.ndarray) -> np.ndarray:
+    """标记速度阶跃：不属于振铃的孤立顶格段（连续 RING_MIN_RUN–RING_GAP 帧），多为跟踪修正。
+    与振铃同样插值修复；顶格超过 RING_GAP 帧视为真实急变速，不修复。"""
     s = np.where(np.abs(a_raw) >= ACC_CAP_FTPS2, np.sign(a_raw), 0)
     n = len(s); flag = np.zeros(n, bool); i = 0
     while i < n:
@@ -185,6 +177,7 @@ def step_mask(a_raw: np.ndarray, ring: np.ndarray) -> np.ndarray:
 
 
 def _repair_ringing(v: np.ndarray, flag: np.ndarray) -> np.ndarray:
+    """flag 段内用段前、段后速度线性插值；段落在轨迹端点时取单侧值。"""
     v = v.copy(); n = len(v); i = 0
     while i < n:
         if not flag[i]:
@@ -192,7 +185,7 @@ def _repair_ringing(v: np.ndarray, flag: np.ndarray) -> np.ndarray:
         j = i
         while j < n and flag[j]:
             j += 1
-        a, b = i - 1, j            # 段前、段后最后/第一个正常帧
+        a, b = i - 1, j            # 段前、段后的正常帧
         if a >= 0 and b < n:
             v[i:j] = np.interp(np.arange(i, j), [a, b], [v[a], v[b]])
         elif a >= 0:
@@ -204,6 +197,7 @@ def _repair_ringing(v: np.ndarray, flag: np.ndarray) -> np.ndarray:
 
 
 def _speed_smooth_for_vehicle(g: pd.DataFrame) -> np.ndarray:
+    """修复振铃与阶跃后的速度；SG_WINDOW 非空时再做 SG 平滑。"""
     v = g[speed_col].to_numpy(dtype=float)
     if "Acceleration" in g:
         a_raw = g["Acceleration"].to_numpy(dtype=float)
@@ -218,6 +212,7 @@ def _speed_smooth_for_vehicle(g: pd.DataFrame) -> np.ndarray:
 
 
 def add_acceleration(df: pd.DataFrame) -> pd.DataFrame:
+    """新增 Ringing、SpeedStep、Speed_smooth、Acc_ftps2、Acc_g 列。"""
     df["Ringing"] = (
         df.groupby(id_col, group_keys=False)
           .apply(lambda g: pd.Series(ringing_mask(g["Acceleration"].to_numpy(dtype=float)), index=g.index))
@@ -231,7 +226,7 @@ def add_acceleration(df: pd.DataFrame) -> pd.DataFrame:
     ).astype(int)
     print(f"速度阶跃（孤立顶格段 ±{RING_PAD / 30:.1f} s）帧: {df['SpeedStep'].mean():.2%}，"
           f"涉及车辆 {df.loc[df['SpeedStep'] == 1, id_col].nunique()}；同样线性插值修复")
-    # 平滑速度（与加速度同一 SG 窗口），供 TTC / phi1 / phi4 使用
+    # 修复后速度，供加速度、TTC、φ 计算使用
     df["Speed_smooth"] = (
         df.groupby(id_col, group_keys=False)
           .apply(lambda g: pd.Series(_speed_smooth_for_vehicle(g), index=g.index))
@@ -262,19 +257,20 @@ def add_acceleration(df: pd.DataFrame) -> pd.DataFrame:
 # =========================
 # 2b) 数据质量标记
 # =========================
-BOUNDARY_BIN_FT = 200.0
-CURVE_BIN_FT = 100.0       # 车道中心曲率分箱（v13）
-MIN_BOUNDARY_BIN = 2000   # 与 accel_thresholds.MIN_BIN_FRAMES 相同
+BOUNDARY_BIN_FT = 200.0    # 观测边界区的纵向分箱，ft
+CURVE_BIN_FT = 100.0       # 车道中心曲率的纵向分箱，ft
+MIN_BOUNDARY_BIN = 2000   # 每箱最少样本，与 accel_thresholds.MIN_BIN_FRAMES 相同
 
 
 def add_quality_flags(df: pd.DataFrame) -> pd.DataFrame:
+    """新增数据质量列：Edge、BadTrack、Extrapolated、RepairZone、BoundaryZone、CurveZone、
+    Lane_ctx（匝道组判定用车道）、SatFrac、BadVehicle。"""
     g   = df.groupby(id_col)
     pos = g.cumcount()
     n   = g[frame_col].transform("size")
     df["Edge"]     = ((pos < EDGE_TRIM_FRAMES) | (pos >= n - EDGE_TRIM_FRAMES)).astype(int)
     df["BadTrack"] = (df["Acc_g"].abs() > MAX_PLAUSIBLE_G).astype(int)
-    # 外推假轨迹：原始速度连续 ≥ EXTRAP_MIN_FRAMES 帧完全不变（且非停车），常伴随横向位置线性漂移，
-    # 是数据提供方在跟踪丢失时的外推结果，不是真实驾驶（v7 抽查 #1）。计入 BadTrack。
+    # 外推假轨迹：速度连续 ≥ EXTRAP_MIN_FRAMES 帧完全不变且非停车，为跟踪丢失时的外推结果，计入 BadTrack
     df = df.sort_values([id_col, frame_col])
     same = (df["Speed"].diff() == 0) & (df[id_col].diff() == 0)
     same = same | same.shift(-1, fill_value=False) & (df[id_col].shift(-1) == df[id_col])
@@ -282,17 +278,16 @@ def add_quality_flags(df: pd.DataFrame) -> pd.DataFrame:
     run_len = same.groupby(grp).transform("size").where(same, 0)
     df["Extrapolated"] = ((run_len >= EXTRAP_MIN_FRAMES) & (df["Speed"] > EXTRAP_MIN_SPEED)).astype(int)
     df["BadTrack"] = (df["BadTrack"] | df["Extrapolated"]).astype(int)
-    # v10（P3）：振铃修复区 —— 修复段（插值/端点保持）内及其边界前后 EDGE_TRIM_FRAMES（1.5 s，与 Edge 同一规则）
-    # 速度是重建值，边界处常出现阶跃，这些帧上的 3σ 不作为证据（见 report_rule.py），但仍参与 φ 计算与训练清洗。
-    ring = (df["Ringing"].fillna(0).astype(int) | df.get("SpeedStep", 0)).astype(int)   # v11：含速度阶跃修复段
+    # 速度修复区：修复段及其边界前后 EDGE_TRIM_FRAMES 帧。速度为重建值，这些帧不作为异常证据
+    # （见 report_rule.py），但仍参与 φ 计算与训练清洗。
+    ring = (df["Ringing"].fillna(0).astype(int) | df.get("SpeedStep", 0)).astype(int)
     bnd = (ring.diff().fillna(0) != 0) & (df[id_col].diff() == 0)
     near = bnd.astype(int).groupby(df[id_col]).transform(
         lambda s: s.rolling(2 * EDGE_TRIM_FRAMES + 1, center=True, min_periods=1).max())
     df["RepairZone"] = ((ring == 1) | (near > 0)).astype(int)
     print(f"振铃修复区（修复段 ±{EDGE_TRIM_FRAMES / 30:.1f} s）帧 {df['RepairZone'].mean():.2%}")
-    # v12（用户确认 2026-11-04）：观测区下游边界 —— v11 复核的匝道/轨迹不可信 DATA 事件全在 lane 0、Local_Y > 7100 ft。
-    #   按 200 ft 纵向分箱（主线 / 匝道分开）统计重建帧（RepairZone | BadTrack）占比；锚点 = 上游半段各箱占比的最大值
-    #   （上游入口区 = 已接受的最差数据质量）。下游半段中占比超过该值的箱视为观测边界区，帧计入 Edge（不可信）。
+    # 观测区下游边界：按纵向分箱（主线 / 匝道分开）统计重建帧（RepairZone | BadTrack）占比，
+    #   以上游半段各箱的最大占比为基准，下游半段超过该值的箱视为观测边界区，计入 Edge。
     yb = (df["Local_Y"] // BOUNDARY_BIN_FT) * BOUNDARY_BIN_FT
     lg = (df["Lane_Num"] == 0).astype(int)
     bad = ((df["RepairZone"] == 1) | (df["BadTrack"] == 1)).astype(float)
@@ -303,7 +298,7 @@ def add_quality_flags(df: pd.DataFrame) -> pd.DataFrame:
     hot = share[(share.index.get_level_values(1) >= ymed) & (share > ref)]
     key = pd.MultiIndex.from_arrays([lg, yb])
     bz = key.isin(hot.index)
-    # 一旦进入边界区，下游所有箱都算（避免中间个别箱回落造成孤岛）
+    # 从首个边界箱起，下游所有箱都算（避免孤岛）
     first_y = {k: float(min(y for (kk, y) in hot.index if kk == k)) for k in set(hot.index.get_level_values(0))}
     bz = np.zeros(len(df), bool)
     for l, y0 in first_y.items():
@@ -311,10 +306,8 @@ def add_quality_flags(df: pd.DataFrame) -> pd.DataFrame:
     df["BoundaryZone"] = bz.astype(int)
     df["Edge"] = (df["Edge"].astype(bool) | bz).astype(int)
     print(f"观测边界区（重建帧占比 > 上游最大 {ref:.1%}）: 起点 {first_y}（0=主线,1=匝道 lane 0），帧 {bz.mean():.2%} → 计入 Edge")
-    # v13（用户确认 2026-11-04）：分流段起点 —— v12 复核 DATA 中 10 个 ramp_geometry 等在 Y≈6300–7000 ft（lane 0/1）。
-    #   每条车道按 100 ft 纵向分箱取车道中心（可信帧 Local_X 中位数，样本 ≥ MIN_BOUNDARY_BIN），相邻箱的中心偏移率
-    #   超过全部"车道×箱"偏移率的 3σ（稳健 σ）记为弯曲箱；连续弯曲段累计偏移 ≥ 半车道宽（LEADER_LAT_TOL_FT，
-    #   与前车判定同一阈值）→ 车道本身在分流。上游零星缓弯（累计约 1 ft）不计。
+    # 分流段起点：每条车道按纵向分箱取车道中心（可信帧 Local_X 中位数），相邻箱中心偏移率 ≥ 3σ（稳健 σ）
+    #   记为弯曲箱；连续弯曲段累计偏移 ≥ 半车道宽（LEADER_LAT_TOL_FT）时，视为车道在此开始分流。
     import utility_phi as _up
     t_ok = (df["Edge"] == 0) & df["Lane_Num"].notna()
     yc = (df["Local_Y"] // CURVE_BIN_FT) * CURVE_BIN_FT
@@ -333,7 +326,7 @@ def add_quality_flags(df: pd.DataFrame) -> pd.DataFrame:
                 j = i
                 while j + 1 < len(ys) and hot_c[j + 1] and ys[j + 1] - ys[j] == CURVE_BIN_FT:
                     j += 1
-                # 段内累计偏移的最大幅度（不用总和：分流末端车道重新编号会造成一次反向大跳，抵消累计偏移）
+                # 取段内累计偏移的最大幅度而非总和：分流末端车道重新编号会造成反向大跳，抵消总和
                 if np.max(np.abs(np.cumsum(vals[i:j + 1]))) >= LEADER_LAT_TOL_FT and ln not in curve_start:
                     curve_start[ln] = float(ys[i])
                 i = j + 1
@@ -343,9 +336,8 @@ def add_quality_flags(df: pd.DataFrame) -> pd.DataFrame:
     for ln, y0 in curve_start.items():
         cz |= (df["Lane_Num"].to_numpy() == ln) & (yc.to_numpy() >= y0)
     df["CurveZone"] = cz.astype(int)
-    # 用户（2026-11-04）：匝道是弯道，沿弯道的横向偏移是正常的 —— 不做掩膜（φ3 已相对弯曲中心线计算、中心线不可靠段自动关闭）。
-    #   v12 复核的匝道误报实为 φ2：驶向出口的车在 lane 1 分流段减速，却按主线曲线判。
-    #   → 分流段（最早的弯曲段起点）以下游、最终驶入匝道（lane 0）的车辆，按"匝道"组（Lane_ctx = 0）用匝道曲线（GT 与 φ2 共用）。
+    # 驶向出口的车在分流段内减速属正常：分流段起点下游、最终驶入匝道（lane 0）的车辆，
+    #   其帧按匝道组（Lane_ctx = 0）使用匝道阈值曲线（GT 与 φ2 共用）。CurveZone 不做掩膜。
     y_div = min(curve_start.values()) if curve_start else np.inf
     exit_veh = df.groupby(id_col)["Lane_Num"].transform(lambda x: (x == 0).any())
     ramp_ctx = exit_veh.to_numpy() & (df["Local_Y"].to_numpy() >= y_div)
@@ -367,12 +359,10 @@ def add_quality_flags(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # =========================
-# 3) TTC 计算
-#    TTC = Space_Headway / (v_ego - v_preceding)
-#    条件：前车存在 & 距离>0 & 本车追近（相对速度>0）
+# 3) TTC 计算：TTC = 净距 / (v_ego − v_leader)，仅在前车存在、净距 > 0、本车追近时计算
 # =========================
 def _position_leaders(df: pd.DataFrame):
-    """逐帧向量化：返回每行的 (前车ID, 车尾-车头净距 ft, 前车平滑速度)。"""
+    """按位置确定前车，返回每行的 (前车 ID, 净距 ft, 前车速度 ft/s)。"""
     n = len(df)
     order  = np.argsort(df[frame_col].to_numpy(), kind="stable")
     frames = df[frame_col].to_numpy()[order]
@@ -393,7 +383,7 @@ def _position_leaders(df: pd.DataFrame):
         has = np.isfinite(dy[np.arange(b - a), j])
         idx = np.arange(a, b)[has]; jj = a + j[has]
         lead[idx] = vid[jj]
-        # Local_Y 为车辆中心（见数据说明）：净距 = 中心距 - 前车半长 - 本车半长
+        # Local_Y 为车辆中心：净距 = 中心距 − 前车半长 − 本车半长
         gap[idx]  = y[jj] - y[idx] - ln[jj] / 2.0 - ln[idx] / 2.0
         vl[idx]   = v[jj]
     out = [np.empty(n) for _ in range(3)]
@@ -403,18 +393,14 @@ def _position_leaders(df: pd.DataFrame):
 
 
 def add_ttc(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    前车按位置重新确定：同一帧中，横向中心距 < LEADER_LAT_TOL_FT（半个车道宽）
-    且在本车前方的最近车辆。不依赖 Lane_Num（分流区 Lane_Num 不可靠，"同车道前车"
-    横向偏差中位数 6.6 ft），也不用 Width（航拍框宽度虚高：轿车 8~9 ft，部分 13~19 ft）。
-    原始 Preceding_Vehicle_ID / Space_Headway 在 TTC<1.5s 的帧里大多是错的
-    （前车 90% 不在同一车道、Space_Headway 与真实位置差中位数 ~570 ft），
-    用它们算出的 TTC 冲突几乎全是伪影。原始两列保留不动，新增：
-      Leader_ID     位置确定的前车
-      Gap_bumper    前车车尾到本车车头净距 = (Y_lead - Y_ego) - L_lead/2 - L_ego/2 (ft)
-                    Local_Y 是车辆中心位置；旧公式 Y_lead - L_lead - Y_ego 只在两车等长时成立，
-                    跟在货车(~75 ft)后面会少算 ~28 ft 净距，造出假 TTC 冲突
-      Preceding_Speed / Rel_Speed / TTC  均基于 Leader_ID 和平滑速度
+    """按位置重新确定前车并计算 TTC。
+
+    前车 = 同一帧中横向中心距 < LEADER_LAT_TOL_FT 且在本车前方的最近车辆。不用 Lane_Num
+    （分流区不可靠）、Width（航拍框宽度虚高），也不用原始 Preceding_Vehicle_ID / Space_Headway
+    （冲突帧中大多错误，原列保留不动）。
+    新增列：Leader_ID；Gap_bumper（前车车尾到本车车头净距，ft）；Preceding_Speed、Rel_Speed、TTC；
+    以及前车不可信的标记 Leader_bad / Leader_overlap / Leader_brief、前车切换的 Prev_Leader_Speed / CutIn、
+    横向错开的 TTC_cleared。
     """
     df = df.sort_values([id_col, time_col, frame_col]).reset_index(drop=True)
     leader, gap, vlead = _position_leaders(df)
@@ -422,8 +408,7 @@ def add_ttc(df: pd.DataFrame) -> pd.DataFrame:
     df["Gap_bumper"]      = gap
     df["Preceding_Speed"] = vlead
 
-    # v10（P3）：前车处于它自己的不可信帧（轨迹首尾 1.5 s / BadTrack / BadVehicle）时，前车速度、间距、TTC 记为缺失。
-    #   例：v9 复核 #9，前车在轨迹末端 1.5 s（同时在振铃修复段内）速度 0.4 s 内 20→25 mph，造出 TTC≈1.8 s。
+    # 前车自身处于不可信帧（Edge / BadTrack / BadVehicle）时，前车速度、净距记为缺失
     qual = (df.set_index([frame_col, id_col])[["Edge", "BadTrack", "BadVehicle"]].max(axis=1)
             .groupby(level=[0, 1]).max())
     lkey = pd.MultiIndex.from_arrays([df[frame_col], df["Leader_ID"].fillna(-1).astype(int)])
@@ -432,9 +417,7 @@ def add_ttc(df: pd.DataFrame) -> pd.DataFrame:
     df.loc[lbad, ["Gap_bumper", "Preceding_Speed"]] = np.nan
     print(f"前车处于不可信帧 → 前车量记为缺失: {lbad.mean():.2%} 帧")
 
-    # v12（用户确认 2026-11-04）：车身重叠 —— 同一前车的一段连续跟随中出现净距 ≤ 0（物理上不可能），
-    #   说明这一对车的位置/车长重建有误，整段的净距、前车速度（及由此算出的 TTC、THW）都不可信 → 记为缺失。
-    #   v11 复核：GT 中 5 个 TTC 冲突为净距 0–1 ft 或为负的假冲突（implausible_gap / 前车错配）。
+    # 车身重叠：同一前车的连续跟随段中出现净距 ≤ 0，说明位置/车长重建有误，整段前车量记为缺失
     lid = df["Leader_ID"].fillna(-1).to_numpy()
     newrun = np.r_[True, (lid[1:] != lid[:-1]) | (df[id_col].to_numpy()[1:] != df[id_col].to_numpy()[:-1])]
     run_id = np.cumsum(newrun)
@@ -443,18 +426,16 @@ def add_ttc(df: pd.DataFrame) -> pd.DataFrame:
     df["Leader_overlap"] = bad_run.astype(int)
     df.loc[bad_run, ["Gap_bumper", "Preceding_Speed"]] = np.nan
     print(f"车身重叠（净距 ≤ 0）的同一前车跟随段 → 前车量记为缺失: {bad_run.mean():.2%} 帧（{int(ovl.sum())} 个重叠帧）")
-    # v15（2026-11-05）：短暂前车 —— 同一前车连续被判定为前车的时长 < 1 s（= GT 最短持续时间 GT_MIN_S）的，
-    #   多为换道途中位置判定的闪变（v14 复核 #99/#110：瞬时出现一辆 0 速"前车"，TTC 0.5 s 后立即切走），
-    #   这段的净距、前车速度（及 TTC、THW）记为缺失。真实的切入会持续成为前车，不受影响。
+    # 短暂前车：同一前车持续 < GT_MIN_S，多为换道途中前车判定的闪变，前车量记为缺失
     run_len = pd.Series(np.ones(len(df)), index=df.index).groupby(run_id).transform("size").to_numpy()
     brief = df["Leader_ID"].notna().to_numpy() & (run_len < MIN_CONSEC_FRAMES_TTC)
     df["Leader_brief"] = brief.astype(int)
     df.loc[brief, ["Gap_bumper", "Preceding_Speed"]] = np.nan
     print(f"短暂前车（同一前车 < {GT_MIN_S:.0f} s）→ 前车量记为缺失: {brief.mean():.2%} 帧")
 
-    # v10（P2）：前车切换。切换后 EDGE_TRIM_FRAMES（1.5 s，≈ 数据估计的跟驰反应延迟中位数）内：
-    #   Prev_Leader_Speed = 原前车此刻的速度（φ1 正常区间同时包含新旧前车速度，驾驶员来不及响应）
-    #   CutIn = 新前车比原前车更近（或原来没有前车）→ 近距离由他车切入引起（φ4 证据不计入本车）
+    # 前车切换后 EDGE_TRIM_FRAMES 帧内（约为跟驰反应延迟）：
+    #   Prev_Leader_Speed = 原前车此刻速度（驾驶员尚未响应，φ1 同时参照新旧前车）；
+    #   CutIn = 新前车更近或原来无前车，即近距离由他车切入引起（φ4 不计入本车）。
     g = df.groupby(id_col)
     L = df["Leader_ID"]; prevL = g["Leader_ID"].shift(); prevG = g["Gap_bumper"].shift()
     first = g.cumcount() == 0
@@ -480,11 +461,8 @@ def add_ttc(df: pd.DataFrame) -> pd.DataFrame:
     )
     df["TTC"] = np.nan
     df.loc[valid, "TTC"] = df.loc[valid, "Gap_bumper"] / df.loc[valid, "Rel_Speed"]
-    # v11（P8，用户确认 2026-11-04）：纵向 TTC 只在"按当前横向运动、追上前车时仍横向重叠"时才算碰撞路径。
-    #   v10 全量复核：GT 的 TTC 冲突中多例是本车（或前车）正在变道离开 —— 纵向间距趋近 0 时两车已横向错开。
-    #   横向分离速度 = 两车横向中心距在 LAT_SEP_FRAMES（0.5 s，与 φ3 横向速度同一步长）内的变化率（同一前车）；
-    #   横向错开所需时间 t_clear = (LEADER_LAT_TOL_FT − |Δx|) / 分离速度，t_clear < TTC → 不在碰撞路径，TTC 记为缺失。
-    #   （LEADER_LAT_TOL_FT 即前车判定用的横向重叠阈值，半车道宽 6 ft。）
+    # 横向错开：按当前横向分离速度（两车横向中心距在 LAT_SEP_FRAMES 内的变化率），
+    #   错开所需时间 t_clear = (LEADER_LAT_TOL_FT − |Δx|) / 分离速度 < TTC 时，两车追上前已错开，TTC 记为缺失。
     xk = df.set_index([frame_col, id_col])["Local_X"]
     xk = xk[~xk.index.duplicated()]
     lk = pd.MultiIndex.from_arrays([df[frame_col], df["Leader_ID"].fillna(-1).astype(int)])
@@ -494,7 +472,7 @@ def add_ttc(df: pd.DataFrame) -> pd.DataFrame:
     vsep = ((dxa - dxa.groupby(df[id_col]).shift(LAT_SEP_FRAMES)) / (LAT_SEP_FRAMES / 30.0)).where(same_l)
     t_clear = np.where(vsep > 0, (LEADER_LAT_TOL_FT - dxa) / vsep, np.inf)
     cleared = df["TTC"].notna() & (t_clear < df["TTC"])
-    print(f"P8 横向错开先于追上（不在碰撞路径）: TTC 有效帧中 {cleared.sum() / max(df['TTC'].notna().sum(), 1):.2%}，"
+    print(f"横向错开先于追上（不在碰撞路径）: TTC 有效帧中 {cleared.sum() / max(df['TTC'].notna().sum(), 1):.2%}，"
           f"其中 TTC<{TTC_SEV_S}s 帧 {int((cleared & (df['TTC'] < TTC_SEV_S)).sum())} → 记为缺失")
     df["TTC_cleared"] = cleared.astype(int)
     df.loc[cleared, "TTC"] = np.nan
@@ -515,20 +493,17 @@ def add_ttc(df: pd.DataFrame) -> pd.DataFrame:
 # 4) 异常标注
 # =========================
 def add_anomaly_labels(df: pd.DataFrame) -> pd.DataFrame:
+    """拟合加减速阈值曲线（供 φ2 使用并保存），并逐帧标注 HardBrake、TailgateTTC_sev 等异常（未做持续时间过滤）。"""
     import accel_thresholds as at
-    # 只在可信帧上标注：排除轨迹首尾 (Edge)、物理不可能的加速度 (BadTrack)、重建失败车辆 (BadVehicle)
+    # 只在可信帧上标注（排除 Edge、BadTrack、BadVehicle）
     ok = ((df["Edge"] == 0) & (df["BadTrack"] == 0) & (df["BadVehicle"] == 0))
 
-    # 速度-阈值曲线（在可信帧上拟合，分车型、加/减速），保存供 New.py 的 φ2 使用
-    # 分组：小汽车·主线 / 货车 / 小汽车·出口匝道（lane 0）
+    # φ2 用的速度-阈值曲线：可信帧上拟合，分组为小汽车主线 / 货车 / 小汽车出口匝道
     grp = at.group_id(df["is_truck"], df.get("Lane_ctx", df["Lane_Num"]))
     curves = at.fit_curves(df["Speed_smooth"], df["Acc_g"], grp, ok)
-    # v11（P9）→ v12（P9 分级 + P11，用户确认 2026-11-04，GT 也扣除情境：GT 应是确定的异常）：
-    #   参照速度（上）= max(本车道 ±500 ft 局部车流中位数, 前车速度)；参照速度（下）= min(同上两者)。
-    #   v12 起前车速度不再限 THW<THW_FREE：v11 复核 GT 中"变道后提速"多为新前车在 400 ft 外（THW≈6 s）、更快。
-    #   追赶落差 = (参照上 − v)/σ，逼近落差 = (v − 参照下)/σ；σ = 跟驰车相对局部车流的稳健 σ（与 φ1 受约束 σ 同一估计）。
-    #   按落差等级（<1σ 稳态 / 1–3σ / 3–5σ / ≥5σ）分别拟合速度-阈值曲线：加速帧用追赶等级、减速帧用逼近等级。
-    #   v11 复核：GT（主口径 61 个匹配事件）中 33 个为正常行为（起步/追赶加速、远处慢车前提前减速）。GT 与 φ2 共用。
+    # 情境等级：参照速度上限 = max(局部车流中位数, 前车速度)，下限 = min(两者)；
+    #   追赶落差 = (上限 − v)/σ，逼近落差 = (v − 下限)/σ，σ 为跟驰车相对局部车流的稳健 σ。
+    #   按等级分别拟合曲线：加速帧用追赶等级，减速帧用逼近等级。
     import utility_phi as up
     from phi1_local import local_speed_z
     v = df["Speed_smooth"].to_numpy(float)
@@ -543,7 +518,7 @@ def add_anomaly_labels(df: pd.DataFrame) -> pd.DataFrame:
     df["ApprCls"] = at.context_class((v - ref_dn) / s_c)
     df["CatchUp"] = (df["CatchCls"] > 0).astype(int)
     o = ok.to_numpy()
-    print(f"P9/P11 情境（σ = {s_c:.2f} ft/s）: 追赶等级 0–3 占可信帧 "
+    print(f"情境（σ = {s_c:.2f} ft/s）: 追赶等级 0–3 占可信帧 "
           f"{[round(float((df['CatchCls'].to_numpy()[o] == k).mean()), 3) for k in range(4)]}；逼近等级 "
           f"{[round(float((df['ApprCls'].to_numpy()[o] == k).mean()), 3) for k in range(4)]}")
     curves = at.add_context_curves(curves, df["Speed_smooth"], df["Acc_g"], grp, df["CatchCls"], df["ApprCls"], ok)
@@ -551,16 +526,14 @@ def add_anomaly_labels(df: pd.DataFrame) -> pd.DataFrame:
     at.summary(curves, df["Speed_smooth"], df["Acc_g"], grp, ok)
     at.save(curves); at.plot(curves)
     df["Acc_z"] = at.zscore(curves, df["Speed_smooth"], df["Acc_g"], grp).round(4)
-    df["Acc_level"] = np.select([df["Acc_z"] >= 2, df["Acc_z"] >= 1], [2, 1], 0)  # 原文：1 一般 / 2 极端
+    df["Acc_level"] = np.select([df["Acc_z"] >= 2, df["Acc_z"] >= 1], [2, 1], 0)  # 1 一般异常 / 2 极端异常
     print(f"原文分级（可信帧）：一般异常(1σ~2σ) {(df.loc[ok, 'Acc_level'] == 1).mean():.2%}，"
           f"极端异常(≥2σ) {(df.loc[ok, 'Acc_level'] == 2).mean():.2%}")
 
-    # v16（用户确认 2026-11-05）：新 GT —— 只收"最异常"的急减速 + TTC 冲突，阈值全部来自本数据：
-    #   z_curve = 周荣贵等(2024) 连续速度-阈值曲线（加/减速样本分开，按速度分箱 μ+kσ 后三次多项式拟合），只分车型（小汽车/货车），
-    #             不分车道、不扣情境（看图：同速度下车道差异小；扣情境会漏掉车队连锁急刹）；
-    #   z_glob  = 全部可信减速样本的 μ+kσ（分车型）。曲线两端（近 0 mph、>90 mph）三次多项式下弯，单用曲线会把很温和的减速判为 5σ，
-    #             要求同时超过全局 5σ 去掉这些（复核：44 个中 43 个为真急刹，1 个疑似轨迹误差 V965）。
-    #   急减速帧 ⇔ min(z_curve, z_glob) ≥ GT_ACC_Z。急加速不进 GT（数据 5σ 只有 0.13–0.18 g，复核多为普通加速；用户选 (a)）。
+    # GT 急减速：min(z_curve, z_glob) ≥ GT_ACC_Z。
+    #   z_curve：速度-阈值曲线 z，只分车型（不分车道、不分情境，以免漏掉车队连锁急刹）；
+    #   z_glob：分车型的全局 μ、σ。曲线两端三次多项式会下弯，取二者较小值避免把温和减速判为异常。
+    #   急加速不进 GT（5σ 仅 0.13–0.18 g，多为普通加速）。
     a_g = df["Acc_g"].to_numpy(float); okv = ok.to_numpy(); trk = df["is_truck"].fillna(0).astype(int).to_numpy()
     curves_gt = at.fit_curves(df["Speed_smooth"], a_g, trk, ok)
     at.save(curves_gt, "accel_threshold_curves_gt.json")
@@ -572,12 +545,12 @@ def add_anomaly_labels(df: pd.DataFrame) -> pd.DataFrame:
             ref = np.abs(a_g[sel & okv]); ref = ref[np.isfinite(ref)]; mu, sd = ref.mean(), ref.std()
             z_glob[sel] = (np.abs(a_g[sel]) - mu) / sd
             print(f"  GT 全局 5σ（{'货车' if tr else '小汽车'}{'加速' if sgn > 0 else '减速'}）: {mu + GT_ACC_Z * sd:.3f} g")
-    df["Acc_zgt"] = np.round(np.minimum(z_cur, z_glob), 4)   # 加/减速两侧都存（φ2 减速侧使用）；GT 只用减速侧
+    df["Acc_zgt"] = np.round(np.minimum(z_cur, z_glob), 4)   # 加/减速两侧都存；GT 只用减速侧
     df["HardBrake"] = ((df["Acc_g"] < 0) & (df["Acc_zgt"] >= GT_ACC_Z) & ok).astype(int)
     df["HardAccel"] = 0
     print(f"  （仅对照，不进 GT）同口径急加速帧：{int(((df['Acc_g'] > 0) & (df['Acc_zgt'] >= GT_ACC_Z) & ok).sum())}")
 
-    # 前车同车道
+    # TTC 冲突要求前车与本车同车道
     lane_of = df.set_index([frame_col, id_col])["Lane_Num"]
     key = pd.MultiIndex.from_arrays([df[frame_col], df["Leader_ID"].fillna(-1).astype(int)])
     lead_lane = lane_of.reindex(key).to_numpy()
@@ -599,9 +572,10 @@ def add_anomaly_labels(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # =========================
-# 5) 连续帧过滤 → Anomaly_30
+# 5) 持续时间过滤 → Anomaly_30
 # =========================
 def _keep_runs_minlen(arr: np.ndarray, min_len: int) -> np.ndarray:
+    """只保留长度 ≥ min_len 的连续 1 段。"""
     out = np.zeros_like(arr)
     i = 0
     while i < len(arr):
@@ -618,15 +592,15 @@ def _keep_runs_minlen(arr: np.ndarray, min_len: int) -> np.ndarray:
 
 
 def _drop_noise_runs(df: pd.DataFrame, flag: pd.Series) -> pd.Series:
-    """对每段连续的急加/减速，统计同车道 ±NB_DY_FT 内、同时段速度变化 > NB_DV_FTPS 的邻车数 n_nb：
-      - 段内有截断帧（1 s 加速度 = ±20 ft/s²）或速度振铃帧（已插值修复，幅度不可信）→ 需 n_nb >= NB_MIN_CAPPED，否则剔除；
-      - 否则原始 Acceleration 饱和帧 > NOISE_SAT_FRAC → 需 n_nb >= 1，否则剔除（重建噪声）。"""
+    """剔除缺乏邻车印证的急变速段（重建噪声）。n_nb = 同车道 ±NB_DY_FT 内、同时段速度变化 > NB_DV_FTPS 的邻车数：
+      - 段内有截断帧或振铃/阶跃修复帧（幅度不可信）→ 需 n_nb ≥ NB_MIN_CAPPED；
+      - 否则原始加速度饱和帧占比 > NOISE_SAT_FRAC → 需 n_nb ≥ 1。"""
     flag = flag.copy()
     by_frame = df[[frame_col, id_col, "Lane_Num", "Local_Y", "Speed_smooth"]].set_index(frame_col).sort_index()
     sat = df["Acceleration"].abs() >= RAW_ACC_BOUND - 1e-3
     capped = df["Acc_ftps2"].abs() >= ACC_CAP_FTPS2
     ring = df["Ringing"].fillna(0).astype(bool) if "Ringing" in df else pd.Series(False, index=df.index)
-    if "SpeedStep" in df:   # v11：速度阶跃修复段的幅度同样不可信
+    if "SpeedStep" in df:
         ring = ring | df["SpeedStep"].fillna(0).astype(bool)
     n_runs = n_sat = n_cap = n_ring = 0
     for vid, g in df[flag == 1].groupby(id_col):
@@ -657,6 +631,7 @@ def _drop_noise_runs(df: pd.DataFrame, flag: pd.Series) -> pd.Series:
 
 
 def add_anomaly_filtered(df: pd.DataFrame) -> pd.DataFrame:
+    """持续时间过滤与噪声剔除，生成 GT_acc、GT_ttc、Anomaly_30（全部 GT）、Anomaly_30_accel（仅加速度）。"""
     def _filter(col, min_frames):
         return (
             df.groupby(id_col, group_keys=False)
@@ -676,18 +651,17 @@ def add_anomaly_filtered(df: pd.DataFrame) -> pd.DataFrame:
     hb_f  = hb_f * acc_f
     ha_f  = ha_f * acc_f
     df["GT_acc"] = ((hb_f == 1) | (ha_f == 1)).astype(int)
-    # v14：物理锚点口径（accel_thresholds.phys_exceed）—— 情境 5σ 且超出物理锚点，持续 ≥ 1 s
-    # v16：不再用文献物理锚点，GT_phys 与 GT_acc 相同（保留列名供下游兼容）
+    # GT_phys 与 GT_acc 相同，仅为下游兼容保留列名
     df["GT_phys"] = df["GT_acc"]
     print(f"GT 物理锚点口径：急加/减速帧 {int(df['GT_acc'].sum())} → 同时超出物理锚点且 ≥1 s {int(df['GT_phys'].sum())}")
     df["GT_ttc"] = (ttc_f == 1).astype(int)
 
-    # Full GT：加速度 + TTC（用于 val 集划分）
+    # 全部 GT（加速度 + TTC），用于 val 集划分
     df["Anomaly_30"] = (
         (hb_f == 1) | (ha_f == 1) | (ttc_f == 1)
     ).astype(int)
 
-    # Accel-only GT：仅加速度（用于模型评估：检查模型能否检测到加速度异常）
+    # 仅加速度 GT，用于模型评估
     df["Anomaly_30_accel"] = (
         (hb_f == 1) | (ha_f == 1)
     ).astype(int)
@@ -706,12 +680,13 @@ def add_anomaly_filtered(df: pd.DataFrame) -> pd.DataFrame:
 # 6) 事件化
 # =========================
 def _build_events_for_vehicle(g: pd.DataFrame, anomaly_col: str = "Anomaly_30") -> pd.DataFrame:
+    """把单车的异常帧连成事件：间隔 ≤ MERGE_GAP_S 合并，前后扩展 CONTEXT_EXPAND_S，扩展后重叠再合并。"""
     g    = g.sort_values(time_col).copy()
     x    = g[anomaly_col].to_numpy(dtype=int)
     t    = g[time_col].to_numpy(dtype=float)
     fr   = g[frame_col].to_numpy(dtype=int)
     a    = g["Acc_g"].to_numpy(dtype=float)
-    # severe 帧 = TTC < 1.5s 或 HardBrake 或 HardAccel（SHRP2 定义均为 severe）
+    # severe 帧 = TailgateTTC_sev / HardBrake / HardAccel
     ttc_sev  = g["TailgateTTC_sev"].fillna(0).to_numpy(dtype=int) if "TailgateTTC_sev" in g.columns else np.zeros(len(g), dtype=int)
     hb       = g["HardBrake"].fillna(0).to_numpy(dtype=int)       if "HardBrake"       in g.columns else np.zeros(len(g), dtype=int)
     ha       = g["HardAccel"].fillna(0).to_numpy(dtype=int)        if "HardAccel"        in g.columns else np.zeros(len(g), dtype=int)
@@ -742,7 +717,6 @@ def _build_events_for_vehicle(g: pd.DataFrame, anomaly_col: str = "Anomaly_30") 
                 "max_g":       float(a[sl].max()),
                 "peak_abs_g":  float(np.abs(a[sl]).max()),
                 "peak_g":      float(a[k]),
-                # severe = 事件段内有任意帧 TTC < 1.5s 或 HardBrake/HardAccel
                 "severity":    "severe" if sev[sl].any() else "moderate",
                 "gt_type":     "|".join(n for n, m in [("harsh_accel", gacc[sl].any()),
                                                        ("ttc_conflict", gttc[sl].any())] if m),
@@ -761,7 +735,7 @@ def _build_events_for_vehicle(g: pd.DataFrame, anomaly_col: str = "Anomaly_30") 
 
     segs = pd.DataFrame(segs).sort_values("start_time").reset_index(drop=True)
 
-    # gap <= MERGE_GAP_S 合并
+    # 间隔 ≤ MERGE_GAP_S 合并
     merged = [segs.iloc[0].to_dict()]
     for r in segs.iloc[1:].to_dict("records"):
         cur = merged[-1]
@@ -816,7 +790,7 @@ def _build_events_for_vehicle(g: pd.DataFrame, anomaly_col: str = "Anomaly_30") 
 
     events = pd.DataFrame(merged2)
 
-    # num_frames / duration_s 统一从 frame 差计算
+    # num_frames / duration_s 由帧号计算
     events["num_frames"] = (events["end_frame"] - events["start_frame"] + 1).astype(int)
     events["duration_s"] = (events["num_frames"] / FPS).round(4)
     events["event_id"]   = np.arange(1, len(events) + 1)
@@ -849,6 +823,7 @@ def eventize(df: pd.DataFrame, anomaly_col: str = "Anomaly_30") -> pd.DataFrame:
 # =========================
 def plot_top_events(df: pd.DataFrame, events_df: pd.DataFrame,
                     out_dir: str = "sanity_plots"):
+    """画持续最长和峰值最大的若干事件的速度、加速度、TTC 曲线。"""
     if events_df.empty:
         print("没有事件，跳过绘图")
         return
@@ -902,7 +877,7 @@ DEFAULT_RAW = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "hi
 def main(input_csv: str = DEFAULT_RAW):
     print("=" * 55)
     print("HighSim Proxy Reference")
-    print(f"GT(v16): 急减速 min(周荣贵曲线 z, 全局 z)>={GT_ACC_Z} | TTC<{TTC_SEV_S}s 同车道 | 持续>={GT_MIN_S}s")
+    print(f"GT: 急减速 min(周荣贵曲线 z, 全局 z)>={GT_ACC_Z} | TTC<{TTC_SEV_S}s 同车道 | 持续>={GT_MIN_S}s")
     print("=" * 55)
 
     df = load_and_filter(input_csv)
@@ -911,9 +886,9 @@ def main(input_csv: str = DEFAULT_RAW):
     df = add_ttc(df)
     df = add_anomaly_labels(df)
     df = add_anomaly_filtered(df)
-    # Full GT 事件（加速度 + TTC）→ 用于 New.py val 集划分
+    # 全部 GT 事件，用于 model.py 的 val 集划分
     events_full  = eventize(df, anomaly_col="Anomaly_30")
-    # Accel-only GT 事件（仅加速度）→ 用于 New.py 模型评估
+    # 仅加速度 GT 事件，用于 model.py 的模型评估
     events_accel = eventize(df, anomaly_col="Anomaly_30_accel")
     plot_top_events(df, events_full)
 

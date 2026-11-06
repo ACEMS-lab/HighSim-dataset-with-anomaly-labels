@@ -1,11 +1,12 @@
 """
-plot_spe_by_cluster.py —— 各驾驶状态（GMM 聚类）训练集 SPE 柱状图（英文、简化；样式参考论文 Fig.3b）。在 runs/<run> 下运行：
+plot_spe_by_cluster.py —— 各 GMM 驾驶状态训练帧 SPE 的柱状图。
 
+数据：train_frame_spe.csv（model.stage_detect 写出）。柱 = 该类 SPE 均值，误差线 = +1 SD（SPE 非负，只画上侧）。
+类名与颜色同 plot_latent_clusters.py。
+
+用法（在 runs/<run> 目录下）：
     python ../../tools/plot_spe_by_cluster.py [OUT=fig_spe_by_cluster.png]
-
-- 数据：train_frame_spe.csv（New.stage_detect 写出：训练帧 SPE = 覆盖窗口最大值，cluster = 覆盖窗口众数）。
-- 柱 = 该类训练帧 SPE 均值；误差线 = +1 SD（只画上侧，SPE 非负）；黑色短虚线 = 该类最终 UCL（方案 C 后，读 log_detect*.txt）。
-- 类名与颜色同 plot_latent_clusters.py（cluster_names.json）。
+环境变量 SHOW_UCL=1：叠加各类最终 UCL（读 log_detect*.txt）。
 """
 import glob
 import json
@@ -23,6 +24,7 @@ COLORS = ["#3b6fb6", "#2a9d8f", "#8ab17d", "#e9a23b", "#c8553d", "#9b72aa", "#6c
 
 
 def final_ucl():
+    """从最新的 log_detect*.txt 读取各类最终 UCL。"""
     logs = sorted(glob.glob("log_detect*.txt"), key=os.path.getmtime)
     for f in reversed(logs):
         txt = open(f, errors="ignore").read()
@@ -45,7 +47,7 @@ def main(out="fig_spe_by_cluster.png"):
     for i, k in enumerate(ks):
         ax.bar(i, mean[k], width=0.55, color=COLORS[k % len(COLORS)], alpha=0.85, edgecolor="none")
         ax.errorbar(i, mean[k], yerr=[[0], [sd[k]]], color="0.3", capsize=5, lw=1)
-        if os.environ.get("SHOW_UCL") == "1" and k in ucl:   # 默认不画（与论文参考图一致）
+        if os.environ.get("SHOW_UCL") == "1" and k in ucl:
             ax.hlines(ucl[k], i - 0.32, i + 0.32, colors="k", linestyles="--", lw=1.2,
                       label="UCL (99%, floored at global)" if i == 0 else None)
     labels = [names.get(str(k), f"C{k}").replace(" ", "\n") for k in ks]

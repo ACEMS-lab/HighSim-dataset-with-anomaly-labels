@@ -1,9 +1,10 @@
 """
-tail_repair_anchor.py —— P6 锚点：轨迹末端修复区之前多远的帧受"真实值→保持值"过渡影响。
+tail_repair_anchor.py —— 标定轨迹末端修复区之前受过渡影响的范围（TAIL_PRE_FRAMES）。
 
-对以修复区（dq=1）结束的轨迹，统计末端修复区起点之前每 0.5 s 分箱的 3σ 帧率（o1–o4 任一），
-以前 3–10 s 的平均帧率为远处参照；从起点往前，第一个帧率 ≤ 参照的分箱即为影响范围的终点。
-用法（在 runs/<run> 下）：python ../../tools/tail_repair_anchor.py
+对以修复区（dq=1）结束的轨迹，统计修复区起点之前每 0.5 s 的 3σ 帧率，以 3–10 s 处为参照，
+往前第一个帧率 ≤ 参照的分箱即影响范围终点。
+
+用法（在 runs/<run> 目录下）：python ../../tools/tail_repair_anchor.py
 """
 import numpy as np
 import pandas as pd
